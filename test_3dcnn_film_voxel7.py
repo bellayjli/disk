@@ -1,15 +1,17 @@
 # =============================================================
 # test_3dcnn_film_voxel7.py
 # 加载训练好的 FiLM-A(voxel7) 3D UNet 模型并在测试集上评估
-# 与训练脚本（voxel7 版本）对齐：
-# - 模型：固定 7 通道体素输入（来自 cnn_input_channels_no_normals.csv；去掉 x_norm/y_norm/z_norm）
+#
+# 与最新版训练脚本（CNN_FiLM_sdf&bm_7.py）对齐要点：
+# - 模型：FiLM-UNet(depth=2)，固定 7 通道体素输入（来自 cnn_input_channels_no_normals.csv）
+# - FiLM 注入：ResidualBlock 内采用 BN -> FiLM -> GELU（而不是 block 输出后再 apply_film）
+# - Stem 也条件化：Conv -> BN -> FiLM -> GELU（让 bc 从第一层参与特征提取）
+# - FiLM 超参：hidden = base_ch * film_mult；gamma/beta 采用 film_scale 缩放
 # - 监督/门控 mask：使用 C0(inside_mask)
 # - X: StandardScaler（使用训练时保存的 mean/scale）
 # - Y: 样本级 Z-score（使用训练时保存的每个样本 mean/std；只在有效点上归一化）
 # - 指标：按样本输出 NRMSE / MAE / MSE / R2 / GradMSE（仅在 mask==1 的点上）
-# - 额外：
-#   A) 保存每个 test sample 的预测场（可选 .npy / 有效点 CSV / ✅整场 full-grid CSV）
-#   B) 将 NRMSE 按 boundary_condition 的“类别/桶”统计（自动推断 bucket 列；否则用某个 bc 维度做分桶）
+# - 可选导出：.npy / 有效点 CSV / ✅整场 full-grid CSV
 # =============================================================
 
 import os
@@ -42,56 +44,91 @@ VOXEL_INPUT = None # (1,7,nx,ny,nz)
 
 
 # =============================================================
-# 模型定义（与训练脚本 voxel7 版本一致）
+# 模型定义（与最新版训练脚本一致）
 # =============================================================
 
-class ConvBlock(nn.Module):
-    """3D Residual Block：Conv3d → BN → GELU → Conv3d → BN → GELU → Dropout3d + residual"""
+class FiLMResidualBlock(nn.Module):
+    """(Conv -> BN -> FiLM -> GELU) x2 -> Dropout3d + residual"""
 
     def __init__(self, in_ch: int, out_ch: int, dropout_p: float = 0.1):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_ch),
-            nn.GELU(),
-            nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_ch),
-            nn.GELU(),
-            nn.Dropout3d(dropout_p),
-        )
+        self.conv1 = nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm3d(out_ch)
+        self.conv2 = nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm3d(out_ch)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout3d(dropout_p)
+
         self.residual_proj = nn.Conv3d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
         residual = self.residual_proj(x)
-        out = self.conv(x)
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = out * (1.0 + gamma) + beta
+        out = self.act(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = out * (1.0 + gamma) + beta
+        out = self.act(out)
+
+        out = self.drop(out)
         return out + residual
 
 
 def build_model_from_ckpt(ckpt: dict) -> nn.Module:
-    """从 best_3dcnn_film_voxel7.pth 重建 FiLM-A(voxel7) 网络结构。"""
+    """从 best_3dcnn_film_voxel7.pth 重建最新版 FiLM-A(voxel7) 网络结构。"""
 
     model_type = str(ckpt.get("model_type", ""))
-    if model_type not in {"FiLM_A_voxel7", "FiLM_A_voxel9", "FiLM_A_voxel12", "FiLM_A"}:
-        raise ValueError(f"ckpt.model_type={model_type!r} 与该测试脚本不匹配（期望 FiLM_A_voxel7）。")
+    allowed_prefixes = {
+        "FiLM_A_voxel7_stem_film_scaled",
+        "FiLM_A_voxel7_stem_film",
+        "FiLM_A_voxel7",
+        "FiLM_A",
+    }
+    if not any(model_type.startswith(p) for p in allowed_prefixes):
+        raise ValueError(
+            f"ckpt.model_type={model_type!r} 与该测试脚本不匹配（期望 FiLM_A_voxel7*）。"
+        )
 
     input_dim = int(ckpt["input_dim"])
     nx = int(ckpt["nx"])
     ny = int(ckpt["ny"])
     nz = int(ckpt["nz"])
 
+    # 训练脚本已固定 depth=2，但这里仍允许从 ckpt 读取并强约束
     depth = int(ckpt.get("depth", 2))
+    if depth != 2:
+        raise ValueError(f"该测试脚本对齐的是 depth=2，但 ckpt.depth={depth}")
+
     base_ch = int(ckpt.get("base_ch", 24))
     dropout_p = float(ckpt.get("dropout_p", 0.1))
-    film_hidden = int(ckpt.get("film_hidden", 96) or 96)
     stem_stride = int(ckpt.get("stem_stride", 2) or 2)
 
-    class FiLMGen(nn.Module):
-        """bc -> {gamma,beta} for each block (channel-wise), shapes: (B,C,1,1,1)."""
+    # ===== FiLM 超参：优先使用 film_mult + film_scale（训练脚本保存的）=====
+    film_mult = ckpt.get("film_mult", None)
+    if film_mult is None:
+        # 兼容旧 ckpt：若只有 film_hidden，则反推一个近似；否则给默认
+        film_hidden = ckpt.get("film_hidden", None)
+        if film_hidden is None or film_hidden is False:
+            film_mult = 4
+        else:
+            film_mult = max(1, int(round(float(film_hidden) / float(base_ch))))
+    film_mult = int(film_mult)
+    film_hidden = int(base_ch * film_mult)
 
-        def __init__(self, input_dim: int, ch_list: list[int], hidden: int):
+    film_scale = float(ckpt.get("film_scale", 1.0))
+
+    class FiLMGen(nn.Module):
+        """bc -> {gamma,beta}; 输出按 film_scale 缩放以稳定训练/推理"""
+
+        def __init__(self, input_dim: int, ch_list: list[int], hidden: int, scale: float):
             super().__init__()
             self.ch_list = ch_list
-            out_dim = 2 * sum(ch_list)  # gamma + beta
+            self.scale = float(scale)
+            out_dim = 2 * sum(ch_list)
             self.net = nn.Sequential(
                 nn.Linear(input_dim, hidden),
                 nn.GELU(),
@@ -105,128 +142,93 @@ def build_model_from_ckpt(ckpt: dict) -> nn.Module:
             v = self.net(bc)  # (B, 2*sumC)
             gammas, betas = [], []
             offset = 0
+            s = self.scale
             for C in self.ch_list:
-                g = v[:, offset : offset + C]
-                offset += C
-                b = v[:, offset : offset + C]
-                offset += C
+                g_raw = v[:, offset: offset + C]; offset += C
+                b_raw = v[:, offset: offset + C]; offset += C
+                g = s * g_raw
+                b = s * b_raw
                 gammas.append(g.view(B, C, 1, 1, 1))
                 betas.append(b.view(B, C, 1, 1, 1))
             return gammas, betas
-
-    def apply_film(x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor):
-        return x * (1.0 + gamma) + beta
-
-    class FiLMConvBlock(nn.Module):
-        def __init__(self, in_ch: int, out_ch: int, dropout_p: float):
-            super().__init__()
-            self.block = ConvBlock(in_ch, out_ch, dropout_p=dropout_p)
-
-        def forward(self, x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor):
-            y = self.block(x)
-            return apply_film(y, gamma, beta)
 
     class CNN3D_FiLM(nn.Module):
         def __init__(self):
             super().__init__()
             self.nx, self.ny, self.nz = nx, ny, nz
-            self.depth = depth
+            self.depth = 2
             self.base_ch = base_ch
+            self.film_mult = film_mult
             self.film_hidden = film_hidden
+            self.film_scale = film_scale
             self.stem_stride = stem_stride
 
-            # 固定输入：7 通道体素输入
+            # 固定输入：7 通道体素输入 + mask
             assert VOXEL_INPUT is not None, "VOXEL_INPUT 未初始化：请先读取 cnn_input_channels_no_normals.csv"
             assert GEOM_MASK is not None, "GEOM_MASK 未初始化：请先从 C0 构造 mask"
             self.register_buffer("voxel_input", VOXEL_INPUT)  # (1,7,nx,ny,nz)
             self.register_buffer("geom_mask", GEOM_MASK)      # (1,1,nx,ny,nz)
 
-            # Stem 下采样
-            self.stem = nn.Sequential(
-                nn.Conv3d(7, base_ch, kernel_size=3, padding=1, stride=self.stem_stride),
-                nn.BatchNorm3d(base_ch),
-                nn.GELU(),
-            )
+            # Stem：Conv -> BN -> FiLM -> GELU
+            self.stem_conv = nn.Conv3d(7, base_ch, kernel_size=3, padding=1, stride=self.stem_stride)
+            self.stem_bn = nn.BatchNorm3d(base_ch)
+            self.stem_act = nn.GELU()
 
             # Encoder
-            self.enc0 = FiLMConvBlock(base_ch, base_ch, dropout_p=dropout_p)
+            self.enc0 = FiLMResidualBlock(base_ch, base_ch, dropout_p=dropout_p)
             self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2)
-            self.enc1 = FiLMConvBlock(base_ch, base_ch * 2, dropout_p=dropout_p)
-            if depth >= 3:
-                self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)
-                self.enc2 = FiLMConvBlock(base_ch * 2, base_ch * 4, dropout_p=dropout_p)
+            self.enc1 = FiLMResidualBlock(base_ch, base_ch * 2, dropout_p=dropout_p)
 
             # Bottleneck
-            bottleneck_ch = base_ch * 2 if depth == 2 else base_ch * 4
-            self.bottleneck = FiLMConvBlock(bottleneck_ch, bottleneck_ch, dropout_p=dropout_p)
+            bottleneck_ch = base_ch * 2
+            self.bottleneck = FiLMResidualBlock(bottleneck_ch, bottleneck_ch, dropout_p=dropout_p)
 
-            # Decoder
-            if depth == 2:
-                self.up1_conv = FiLMConvBlock(bottleneck_ch + base_ch, base_ch, dropout_p=dropout_p)
-                dec_out_ch = base_ch
-            else:
-                self.up2_conv = FiLMConvBlock(bottleneck_ch + base_ch * 2, base_ch * 2, dropout_p=dropout_p)
-                self.up1_conv = FiLMConvBlock(base_ch * 2 + base_ch, base_ch, dropout_p=dropout_p)
-                dec_out_ch = base_ch
-
-            self.out_proj = nn.Conv3d(dec_out_ch, base_ch, kernel_size=1)
+            # Decoder (depth=2 只有 up1)
+            self.up1_conv = FiLMResidualBlock(bottleneck_ch + base_ch, base_ch, dropout_p=dropout_p)
+            self.out_proj = nn.Conv3d(base_ch, base_ch, kernel_size=1)
 
             # 全分辨率融合：decoder_feat + 7 通道体素输入
-            self.geom_block = FiLMConvBlock(base_ch + 7, base_ch, dropout_p=dropout_p)
+            self.geom_block = FiLMResidualBlock(base_ch + 7, base_ch, dropout_p=dropout_p)
             self.final_conv = nn.Conv3d(base_ch, 1, kernel_size=1)
 
-            # FiLM 通道列表（顺序必须与 forward 完全一致）
-            ch_list = [base_ch, base_ch * 2]
-            if depth >= 3:
-                ch_list.append(base_ch * 4)
-            ch_list.append(bottleneck_ch)
-            if depth == 2:
-                ch_list.append(base_ch)      # up1
-            else:
-                ch_list.append(base_ch * 2)  # up2
-                ch_list.append(base_ch)      # up1
-            ch_list.append(base_ch)          # geom_block
-            self.film = FiLMGen(input_dim=input_dim, ch_list=ch_list, hidden=film_hidden)
+            # FiLM 注入点通道列表（严格对齐训练脚本的 forward 顺序）
+            # 0) stem, 1) enc0, 2) enc1, 3) bottleneck, 4) up1, 5) geom_block
+            ch_list = [base_ch, base_ch, base_ch * 2, base_ch * 2, base_ch, base_ch]
+            self.film = FiLMGen(input_dim=input_dim, ch_list=ch_list, hidden=film_hidden, scale=film_scale)
 
         def forward(self, bc: torch.Tensor) -> torch.Tensor:
             B = bc.size(0)
             vox = self.voxel_input.expand(B, -1, -1, -1, -1)    # (B,7,nx,ny,nz)
             mask_ch = self.geom_mask.expand(B, -1, -1, -1, -1)  # (B,1,nx,ny,nz)
 
-            x = self.stem(vox)
-
             gammas, betas = self.film(bc)
             gi = 0
 
+            # Stem: Conv -> BN -> FiLM -> GELU
+            x = self.stem_conv(vox)
+            x = self.stem_bn(x)
+            x = x * (1.0 + gammas[gi]) + betas[gi]
+            x = self.stem_act(x)
+            gi += 1
+
+            # Encoder
             x0 = self.enc0(x, gammas[gi], betas[gi]); gi += 1
             x1 = self.pool1(x0)
             x1 = self.enc1(x1, gammas[gi], betas[gi]); gi += 1
 
-            if self.depth >= 3:
-                x2 = self.pool2(x1)
-                x2 = self.enc2(x2, gammas[gi], betas[gi]); gi += 1
-                xb = self.bottleneck(x2, gammas[gi], betas[gi]); gi += 1
+            # Bottleneck
+            xb = self.bottleneck(x1, gammas[gi], betas[gi]); gi += 1
 
-                x_up2 = F.interpolate(xb, size=x1.shape[2:], mode="trilinear", align_corners=False)
-                x_cat2 = torch.cat([x_up2, x1], dim=1)
-                x_dec2 = self.up2_conv(x_cat2, gammas[gi], betas[gi]); gi += 1
-
-                x_up1 = F.interpolate(x_dec2, size=x0.shape[2:], mode="trilinear", align_corners=False)
-                x_cat1 = torch.cat([x_up1, x0], dim=1)
-                x_dec = self.up1_conv(x_cat1, gammas[gi], betas[gi]); gi += 1
-            else:
-                xb = self.bottleneck(x1, gammas[gi], betas[gi]); gi += 1
-
-                x_up = F.interpolate(xb, size=x0.shape[2:], mode="trilinear", align_corners=False)
-                x_cat = torch.cat([x_up, x0], dim=1)
-                x_dec = self.up1_conv(x_cat, gammas[gi], betas[gi]); gi += 1
-
+            # Decoder up1
+            x_up = F.interpolate(xb, size=x0.shape[2:], mode="trilinear", align_corners=False)
+            x_cat = torch.cat([x_up, x0], dim=1)
+            x_dec = self.up1_conv(x_cat, gammas[gi], betas[gi]); gi += 1
             x_dec = self.out_proj(x_dec)
 
-            x_dec_full = F.interpolate(
-                x_dec, size=(self.nx, self.ny, self.nz), mode="trilinear", align_corners=False
-            )
+            # Back to full resolution
+            x_dec_full = F.interpolate(x_dec, size=(self.nx, self.ny, self.nz), mode="trilinear", align_corners=False)
 
+            # Fuse with voxel input at full res
             vox_full = self.voxel_input.expand(B, -1, -1, -1, -1)
             x_full = torch.cat([x_dec_full, vox_full], dim=1)  # (B,base_ch+7,nx,ny,nz)
             x_full = self.geom_block(x_full, gammas[gi], betas[gi]); gi += 1
@@ -256,9 +258,7 @@ def masked_loss(
         per_elem = F.smooth_l1_loss(pred, target, reduction="none")
         masked = per_elem * mask
     else:
-        diff2 = (pred - target) ** 2
-        masked = diff2 * mask
-
+        masked = ((pred - target) ** 2) * mask
     base_loss = masked.sum() / (mask.sum() + 1e-8)
 
     def _spatial_grads(t: torch.Tensor):
@@ -276,9 +276,9 @@ def masked_loss(
 
     grad_loss = pred.new_tensor(0.0)
     for pd, td, md in [(pred_dx, true_dx, mask_dx), (pred_dy, true_dy, mask_dy), (pred_dz, true_dz, mask_dz)]:
-        diff2 = (pd - td) ** 2
-        grad_loss += (diff2 * md).sum() / (md.sum() + 1e-8)
+        grad_loss += (((pd - td) ** 2) * md).sum() / (md.sum() + 1e-8)
     grad_loss = grad_loss / 3.0
+
     return base_loss + grad_weight * grad_loss
 
 
@@ -434,7 +434,7 @@ def save_prediction_artifacts(
     """保存：
     - （可选）全网格预测/真值/误差/mask 为 .npy
     - （可选）只导出有效点的 CSV：x,y,z,true,pred,err
-    - ✅整场 CSV：x,y,z,Temp_pred,Temp_true,Temp_err,mask
+    - （可选）整场 CSV：x,y,z,Temp_pred,Temp_true,Temp_err,mask
       注：脚本外部已把 mask==0 的点置零，所以 Temp_* 在无信息点上为 0。
     """
     _ensure_dir(out_dir)
@@ -491,63 +491,6 @@ def save_prediction_artifacts(
 
 
 # =============================================================
-# 分桶统计：NRMSE 按某个类别/桶
-# =============================================================
-
-def infer_bucket_labels(df_bc: pd.DataFrame, test_idx: np.ndarray) -> tuple[str, np.ndarray]:
-    """尽量自动推断用于分桶的列："""
-    prefer_names = ["class", "category", "label", "type", "group"]
-    for name in prefer_names:
-        if name in df_bc.columns:
-            b = df_bc.loc[test_idx, name].to_numpy()
-            return name, b
-
-    if df_bc.shape[1] >= 8:
-        name = df_bc.columns[7]
-        b = df_bc.iloc[test_idx, 7].to_numpy()
-        return str(name), b
-
-    x0 = df_bc.iloc[:, 0].to_numpy(dtype=np.float32)
-    q = np.quantile(x0, [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
-    q = np.unique(q)
-    if q.size <= 2:
-        b_all = np.array(["all"] * len(df_bc), dtype=object)
-        return "bc0(all)", b_all[test_idx]
-
-    bins = q[1:-1]
-    idx = np.digitize(x0, bins, right=True)
-    labels = np.array([f"qbin_{i}" for i in idx], dtype=object)
-    return "bc0_quantile_bins", labels[test_idx]
-
-
-def summarize_by_bucket(test_idx: np.ndarray, nrmse_list: list[float], df_bc: pd.DataFrame, out_dir: str):
-    bucket_name, bucket_labels = infer_bucket_labels(df_bc, test_idx)
-
-    rows = []
-    for b in np.unique(bucket_labels.astype(object)):
-        sel = np.where(bucket_labels == b)[0]
-        vals = np.asarray([nrmse_list[i] for i in sel], dtype=np.float64)
-        rows.append(
-            {
-                "bucket_name": bucket_name,
-                "bucket": b,
-                "count": int(sel.size),
-                "nrmse_mean": float(np.nanmean(vals)) if sel.size else np.nan,
-                "nrmse_std": float(np.nanstd(vals)) if sel.size else np.nan,
-                "nrmse_min": float(np.nanmin(vals)) if sel.size else np.nan,
-                "nrmse_max": float(np.nanmax(vals)) if sel.size else np.nan,
-            }
-        )
-
-    df = pd.DataFrame(rows).sort_values(by=["count"], ascending=False)
-    print("===== Bucket summary (NRMSE) =====")
-    print(df.to_string(index=False))
-
-    _ensure_dir(out_dir)
-    df.to_csv(os.path.join(out_dir, "bucket_summary_nrmse.csv"), index=False)
-
-
-# =============================================================
 # 主流程：加载 ckpt → 读取 voxel/temp/bc → 构建 test set → 推理评估
 # =============================================================
 
@@ -556,38 +499,36 @@ datapath_bc = "data/boundary_condition.csv"
 datapath_temp = "data/Temp_all.csv"
 datapath_voxel = "data/cnn_input_channels_no_normals.csv"
 
-# ===================== 预测保存设置（你关心这里） =====================
+# ===================== 预测保存设置 =====================
 SAVE_DIR = "test_outputs_voxel7"
 
-SAVE_PRED_NPY = False              # 你要的是 CSV，npy 可以关掉
-SAVE_VALID_POINTS_CSV = False      # 你要的是整场，不需要 valid-only
-SAVE_FULL_GRID_CSV = False          # ✅整场 full-grid CSV
+SAVE_PRED_NPY = False              # 需要 .npy 就打开
+SAVE_VALID_POINTS_CSV = False      # 仅导出有效点（x,y,z,true,pred,err）
+SAVE_FULL_GRID_CSV = False         # ✅整场 full-grid CSV（x,y,z,Temp_pred,Temp_true,Temp_err,mask）
 
-CSV_FULLGRID_CHUNKSIZE = 1_000_000 # 防止一次性写太大卡住（可按需调整）
-# =====================================================================
+CSV_FULLGRID_CHUNKSIZE = 1_000_000
+# =======================================================
 
 print(f"Loading checkpoint: {CKPT_PATH}")
 # ⚠️ 注意：weights_only=False 可能带来任意代码执行风险，只对可信 ckpt 使用。
 ckpt = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
 
+print("===== ckpt meta =====")
 print(
-    f"[ckpt] model_type={ckpt.get('model_type', 'NA')}, film_hidden={ckpt.get('film_hidden', 'NA')}, stem_stride={ckpt.get('stem_stride','NA')}, "
-    f"depth={ckpt.get('depth', 'NA')}, base_ch={ckpt.get('base_ch', 'NA')}, dropout_p={ckpt.get('dropout_p', 'NA')}"
+    f"model_type={ckpt.get('model_type','NA')}, depth={ckpt.get('depth','NA')}, base_ch={ckpt.get('base_ch','NA')}, "
+    f"dropout_p={ckpt.get('dropout_p','NA')}, stem_stride={ckpt.get('stem_stride','NA')}"
 )
 print(
-    f"[ckpt] lr={ckpt.get('lr', 'NA')}, weight_decay={ckpt.get('weight_decay', 'NA')}, "
-    f"loss_type={ckpt.get('loss_type', 'NA')}, grad_weight={ckpt.get('grad_weight', 'NA')}"
+    f"film_mult={ckpt.get('film_mult','NA')}, film_scale={ckpt.get('film_scale','NA')}, "
+    f"lr={ckpt.get('lr','NA')}, weight_decay={ckpt.get('weight_decay','NA')}, "
+    f"loss_type={ckpt.get('loss_type','NA')}, grad_weight={ckpt.get('grad_weight','NA')}"
 )
 
 # -------------------------------------------------------------
 # 读取 7 通道体素输入（与训练脚本一致）
 # -------------------------------------------------------------
 df_vox = pd.read_csv(datapath_voxel)
-required_cols = [
-    "x", "y", "z",
-    "C0", "C1", "C2", "C3", "C4", "C5",
-    "sdf",
-]
+required_cols = ["x", "y", "z", "C0", "C1", "C2", "C3", "C4", "C5", "sdf"]
 missing = [c for c in required_cols if c not in df_vox.columns]
 if missing:
     raise KeyError(f"cnn_input_channels_no_normals.csv 缺少列: {missing}")
@@ -612,18 +553,13 @@ x_index = {float(v): i for i, v in enumerate(x_unique)}
 y_index = {float(v): i for i, v in enumerate(y_unique)}
 z_index = {float(v): i for i, v in enumerate(z_unique)}
 
-# 7 通道输入顺序：优先使用 ckpt 中保存的 voxel_cols；否则用默认顺序
-col_order = ckpt.get(
-    "voxel_cols",
-    ["C0", "C1", "C2", "C3", "C4", "C5", "sdf"],
-)
+# 7 通道输入顺序：使用 ckpt 保存的 voxel_cols（训练脚本保存）；否则用默认顺序
+col_order = ckpt.get("voxel_cols", ["C0", "C1", "C2", "C3", "C4", "C5", "sdf"])
 
-# 校验列存在
 missing_ch = [c for c in col_order if c not in df_vox.columns]
 if missing_ch:
     raise KeyError(f"voxel_cols 中包含不存在的列: {missing_ch}；df_vox.columns={list(df_vox.columns)}")
 
-# 构建体素张量：(C, nx, ny, nz)
 voxel_grid = np.zeros((len(col_order), nx, ny, nz), dtype=np.float32)
 cols_np = [df_vox[c].to_numpy(dtype=np.float32) for c in col_order]
 
@@ -633,13 +569,14 @@ for i in range(df_vox.shape[0]):
     iz = z_index[float(zv[i])]
     voxel_grid[:, ix, iy, iz] = np.array([c[i] for c in cols_np], dtype=np.float32)
 
-# C0 仍作为 inside_mask（mask 逻辑不变）
+# C0 作为 inside_mask
+if "C0" not in col_order:
+    raise ValueError(f"voxel_cols 必须包含 C0 用于 mask，但现在是: {col_order}")
 geom_mask_np = (voxel_grid[col_order.index("C0")] > 0.5).astype(np.float32)
 GEOM_MASK = torch.tensor(geom_mask_np[None, None, ...], dtype=torch.float32, device=device)
 VOXEL_INPUT = torch.tensor(voxel_grid[None, ...], dtype=torch.float32, device=device)
 print(f"C0(inside_mask) 占比: {geom_mask_np.mean() * 100:.3f}%")
 
-# 线性索引：优先使用 ckpt 保存的 lin_valid
 lin_ckpt = ckpt.get("lin_valid", None)
 if lin_ckpt is None:
     raise ValueError("ckpt 中未找到 lin_valid；请使用新版训练脚本保存的模型。")
@@ -663,7 +600,6 @@ def _as_samples_first(a: np.ndarray, n_points: int) -> np.ndarray:
     raise ValueError(f"Temp_all.csv 维度 {a.shape} 与点数 {n_points} 不匹配。")
 
 if (T_np.shape[0] == valid_points) or (T_np.shape[1] == valid_points):
-    # 旧格式：仅有效点
     Y_valid = _as_samples_first(T_np, valid_points)  # (num_samples, valid_points)
     num_samples = int(Y_valid.shape[0])
     print(f"温度样本数: {num_samples}, 格式=仅有效点, 有效点数: {valid_points}")
@@ -672,7 +608,6 @@ if (T_np.shape[0] == valid_points) or (T_np.shape[1] == valid_points):
     Y_grid_flat[:, lin] = Y_valid
 
 elif (T_np.shape[0] == total_points) or (T_np.shape[1] == total_points):
-    # 新格式：全点（顺序与 df_vox 行顺序一致）
     Y_all = _as_samples_first(T_np, total_points)  # (num_samples, total_points)
     num_samples = int(Y_all.shape[0])
     print(f"温度样本数: {num_samples}, 格式=全网格点, 总点数: {total_points}, 有效点数: {valid_points}")
@@ -709,7 +644,7 @@ else:
 print(f"测试集数量: {len(test_idx)}")
 
 # -------------------------------------------------------------
-# 恢复标准化参数
+# 恢复标准化参数（与训练脚本保存一致）
 # -------------------------------------------------------------
 x_mean = ckpt.get("x_mean", None)
 x_scale = ckpt.get("x_scale", None)
@@ -781,7 +716,6 @@ for k in sorted(by_top_total.keys(), key=lambda x: (-by_top_total[x], x)):
     print(f"{k:>14s} | total={_format_int(by_top_total[k]):>12s} | trainable={_format_int(by_top_train.get(k, 0)):>12s}")
 print("")
 
-
 # -------------------------------------------------------------
 # DataLoader
 # -------------------------------------------------------------
@@ -798,11 +732,9 @@ test_loader = DataLoader(
     pin_memory=(device.type == "cuda"),
 )
 
-
 # =============================================================
 # 推理 + 评估
 # =============================================================
-
 NRMSE_list, MAE_list, MSE_list, R2_list, GradMSE_list = [], [], [], [], []
 
 loss_type_ckpt = ckpt.get("loss_type", "mse")
@@ -855,7 +787,7 @@ with torch.no_grad():
             true_real = yb_scaled_np[b] * s + m
             mask_real = mb_np[b]
 
-            # 你说的“无信息点 Temp 已置零”：这里就完成了
+            # 无信息点（mask==0）置零：与训练/评估口径保持一致
             pred_real[mask_real < 0.5] = 0.0
             true_real[mask_real < 0.5] = 0.0
 
@@ -880,11 +812,9 @@ with torch.no_grad():
                     save_npy=SAVE_PRED_NPY,
                     save_csv_valid_points=SAVE_VALID_POINTS_CSV,
                     save_csv_full_grid=SAVE_FULL_GRID_CSV,
-                    csv_fullgrid_chunksize=CSV_FULLGRID_CHUNKSIZE,
                 )
 
         base += B
-
 
 if pred_batches > 0:
     avg_batch = pred_time_sum / pred_batches
