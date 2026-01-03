@@ -18,6 +18,23 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 import os
+# ===================== 随机种子（全局） =====================
+import random
+
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+
+# 为了可复现（不影响你现有结构）
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+# ===========================================================
 
 # -------------------------------------------------------------
 # 全局监督 Mask（1,1,nx,ny,nz）：来自 C0（inside_mask）
@@ -387,7 +404,9 @@ def masked_loss(
 # =============================================================
 # Optuna 目标函数：搜索结构超参 + lr + weight_decay（验证集 EarlyStopping）
 # =============================================================
-
+# DataLoader 用的随机生成器
+g = torch.Generator()
+g.manual_seed(SEED)
 def objective(trial: optuna.trial.Trial) -> float:
     model = create_cnn3d_from_trial(trial, input_dim, nx, ny, nz)
 
@@ -409,6 +428,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         ),
         batch_size=BATCH_SIZE,
         shuffle=True,
+        generator=g,
         pin_memory=(device.type == "cuda"),
     )
 
@@ -504,6 +524,7 @@ train_loader = DataLoader(
     ),
     batch_size=BATCH_SIZE,
     shuffle=True,
+    generator=g,
     pin_memory=(device.type == "cuda"),
 )
 
@@ -610,6 +631,7 @@ trainval_loader = DataLoader(
     ),
     batch_size=BATCH_SIZE,
     shuffle=True,
+    generator=g,
     pin_memory=(device.type == "cuda"),
 )
 
