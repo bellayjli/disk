@@ -907,14 +907,14 @@ print(df)
 # 命令行用法示例
 # =============================================================
 # 1) 在当前目录测试所有 best+last：
-#    CKPT_PREFIX="best_CNN_FiLM_sdf+bm_GN_RemoveStem" CKPT_KIND=both python test_3dcnn_film_voxel7_batch.py
+#    CKPT_PREFIX="best_CNN_FiLM_sdf+bm_GN_RemoveStem" CKPT_KIND=both python test_CNN_FiLM_sdf+bm_GN_RemoveStem.py
 #
 # 2) 指定 ckpt 目录（比如 ./ckpt），只测 best：
 #    CKPT_DIR="./ckpt" CKPT_PREFIX="best_CNN_FiLM_sdf+bm_GN_RemoveStem" CKPT_KIND=best OUTPUT_CSV="ckpt/test_best.csv" \
-#    python test_3dcnn_film_voxel7_batch.py
+#    python test_CNN_FiLM_sdf+bm_GN_RemoveStem.py
 #
 # 3) 你想同时开保存 full-grid CSV（很大！）：
-#    SAVE_FULL_GRID_CSV=1 SAVE_DIR="test_outputs" python test_3dcnn_film_voxel7_batch.py
+#    SAVE_FULL_GRID_CSV=1 SAVE_DIR="test_outputs" python test_CNN_FiLM_sdf+bm_GN_RemoveStem.py
 #
 # 4) 用不同 batch：
-#    BATCH_SIZE=8 python test_3dcnn_film_voxel7_batch.py
+#    BATCH_SIZE=8 python test_CNN_FiLM_sdf+bm_GN_RemoveStem.py

@@ -1,13 +1,18 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 # =============================================================
-# CNN_FiLM_sdf&bm_7.py  ——  边界条件 → 3D 温度场
+# CNN_FiLM_sdf+bm_GN_RemoveStem_Bottleneck.py  ——  边界条件 → 3D 温度场
 # 3D UNet (depth=3) + Optuna + Mask + 小批量训练（避免 OOM）
 #
-# 修改点（2026-01-15）：
+# Bottleneck-only FiLM (linear generator)
+#
+# 修改点（2026-01-xx）：
+# 0) two-stage -> single-stage fixed-budget train (save BEST EMA ckpt + LAST ckpt)
 # 1) trial -> params: create_cnn3d_from_params(params, ...)
-# 2) best_params 落盘 JSON
-# 3) RUN_MODE: search vs train-only
-# 4) 多 seed 只影响训练阶段：search 用 SEARCH_SEED 固定；train 用 SEEDS
-# 5) 同一份超参跑一组 seeds，并输出汇总 seed_summary.csv
+# 2) best_params dump to JSON
+# 3) RUN_MODE: "search" vs "train"
+# 4) multi-seed affects TRAIN ONLY: search uses SEARCH_SEED fixed; train uses SEEDS
+# 5) run a list of seeds with same hyperparams and write seed_summary_film_bottleneck.csv
 # =============================================================
 
 import os
@@ -31,38 +36,44 @@ from sklearn.preprocessing import StandardScaler
 # 运行模式 / 配置（环境变量）
 # =============================================================
 RUN_MODE = os.environ.get("RUN_MODE", "search").strip().lower()  # "search" or "train"
-TRAIN_AFTER_SEARCH = os.environ.get("TRAIN_AFTER_SEARCH", "1").strip() not in ("0", "false", "no")
-BEST_PARAMS_PATH = os.environ.get("BEST_PARAMS_PATH", "best_params_film.json")
+BEST_PARAMS_PATH = os.environ.get("BEST_PARAMS_PATH", "best_params_film_bottleneck.json")
 
-# Search 阶段固定 seed（保证 trial 可比；换训练 seed 不会影响搜索）
+# Search 阶段固定 seed（保证 trial 可比）
 SEARCH_SEED = int(os.environ.get("SEARCH_SEED", "42"))
 
-# 训练阶段 seed 列表（只影响训练）
+# 训练阶段 seeds（只影响训练）
 # 用法：SEEDS="42,43,44,45,46"
 SEEDS_ENV = os.environ.get("SEEDS", "").strip()
 if SEEDS_ENV:
     SEEDS: List[int] = [int(s) for s in SEEDS_ENV.split(",") if s.strip() != ""]
 else:
-    # 兼容：如果你只想跑一个 seed，可以用 SEED=43
-    SEEDS = [int(os.environ.get("SEED", "43"))]
+    SEEDS = [int(os.environ.get("SEED", "42"))]
 
 # Optuna trials
 N_TRIALS = int(os.environ.get("N_TRIALS", "20"))
 
-# 固定训练预算（你的单阶段 fixed-budget 逻辑）
-TOTAL_EPOCHS = int(os.environ.get("TOTAL_EPOCHS", "500"))
+# 固定训练预算（train-only 的单阶段 fixed-budget）
+TOTAL_EPOCHS = int(os.environ.get("TOTAL_EPOCHS", "300"))
 WARMUP_EPOCHS = int(os.environ.get("WARMUP_EPOCHS", "20"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 
-# 输出路径
-SUMMARY_CSV_PATH = os.environ.get("SUMMARY_CSV", "seed_summary_film_allBlock.csv")
+# Search objective 的训练预算
+SEARCH_EPOCHS = int(os.environ.get("SEARCH_EPOCHS", "80"))
 
-# ckpt 命名前缀
-CKPT_PREFIX = os.environ.get("CKPT_PREFIX", "best_CNN_FiLM_sdf+bm_GN_RemoveStem")
+# EMA
+VAL_EMA_ALPHA = float(os.environ.get("VAL_EMA_ALPHA", "0.30"))
+MIN_DELTA = float(os.environ.get("MIN_DELTA", "1e-6"))
+
+# cosine eta_min ratio
+ETA_MIN_RATIO = float(os.environ.get("ETA_MIN_RATIO", "1e-2"))
+
+# 输出
+SUMMARY_CSV_PATH = os.environ.get("SUMMARY_CSV", "seed_summary_film_bottleneck.csv")
+CKPT_PREFIX = os.environ.get("CKPT_PREFIX", "CNN_FiLM_BottleneckOnly")
 
 
 # =============================================================
-# 随机种子工具（训练阶段会反复调用；search 阶段也会固定调用）
+# 随机种子工具
 # =============================================================
 def set_seed(seed: int):
     random.seed(seed)
@@ -87,20 +98,23 @@ def load_best_params(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+# =============================================================
+# 设备
+# =============================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+if device.type == "cuda":
+    torch.cuda.init()
+    print(f"CUDA devices: {torch.cuda.device_count()} visible.")
+PIN_MEMORY = (device.type == "cuda")
+
+
 # -------------------------------------------------------------
 # 全局监督 Mask（1,1,nx,ny,nz）：来自 C0（inside_mask）
 # 固定 3D 体素输入（1,7,nx,ny,nz）：来自 cnn_input_channels_no_normals.csv
 # -------------------------------------------------------------
 GEOM_MASK = None
 VOXEL_INPUT = None
-
-# --------------------- 设备 ---------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
-
-if device.type == "cuda":
-    torch.cuda.init()
-    print(f"CUDA devices: {torch.cuda.device_count()} visible.")
 
 
 def make_gn(C: int, max_groups: int = 8):
@@ -110,9 +124,34 @@ def make_gn(C: int, max_groups: int = 8):
     return nn.GroupNorm(G, C)
 
 
-# =============================================================
-# FiLM Residual Block（FiLM 放在 GN 后、激活前）
-# =============================================================
+class ConvBlock(nn.Module):
+    """(Conv -> GN -> GELU) x2 -> Dropout + residual (NO FiLM)"""
+
+    def __init__(self, in_ch: int, out_ch: int, dropout_p: float = 0.1):
+        super().__init__()
+        self.conv1 = nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.norm1 = make_gn(out_ch)
+        self.conv2 = nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1)
+        self.norm2 = make_gn(out_ch)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout3d(dropout_p)
+        self.residual_proj = nn.Conv3d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.residual_proj(x)
+
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.act(out)
+
+        out = self.conv2(out)
+        out = self.norm2(out)
+        out = self.act(out)
+
+        out = self.drop(out)
+        return out + residual
+
+
 class FiLMResidualBlock(nn.Module):
     """(Conv -> GN -> FiLM -> GELU) x2 -> Dropout + residual"""
 
@@ -148,179 +187,116 @@ class FiLMResidualBlock(nn.Module):
 # =============================================================
 def create_cnn3d_from_params(params: Dict[str, Any], input_dim: int, nx: int, ny: int, nz: int) -> nn.Module:
     """
-    depth=3 的 FiLM-UNet(voxel7)：
+    depth=3 的 FiLM-UNet(voxel7)（bottleneck-only FiLM）：
     - 体素输入固定 7 通道
-    - bc(6维) 生成各层 gamma/beta
+    - bc(6维) 只用于生成 bottleneck 的 gamma/beta（linear）
     """
     depth = 3
     base_ch = 24
 
     dropout_p = float(params.get("dropout_p", 0.1))
-
-    # 固定常数（你原脚本写死的）
-    film_hidden = int(params.get("film_hidden", 96))
-
     film_scale = float(params.get("film_scale", 1.0))
-    film_mlp_dropout = float(params.get("film_mlp_dropout", 0.0))
 
     class FiLMGen(nn.Module):
-        """bc -> {gamma,beta} for each injection point; each is (B,C,1,1,1)."""
+        """Linear FiLM generator: bc -> (gamma, beta) for bottleneck only."""
 
-        def __init__(self, input_dim: int, ch_list: list[int], hidden: int, scale: float, mlp_dropout: float):
+        def __init__(self, input_dim: int, C: int, scale: float):
             super().__init__()
-            self.ch_list = ch_list
+            self.C = int(C)
             self.scale = float(scale)
-            out_dim = 2 * sum(ch_list)
-            p = float(mlp_dropout)
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, hidden),
-                nn.GELU(),
-                nn.Dropout(p=p),
-                nn.Linear(hidden, hidden),
-                nn.GELU(),
-                nn.Dropout(p=p),
-                nn.Linear(hidden, out_dim),
-            )
+            self.fc = nn.Linear(input_dim, 2 * self.C)
 
         def forward(self, bc: torch.Tensor):
             B = bc.size(0)
-            v = self.net(bc)  # (B, 2*sumC)
-            gammas, betas = [], []
-            offset = 0
+            v = self.fc(bc)  # (B, 2C)
+            g_raw = v[:, : self.C]
+            b_raw = v[:, self.C:]
             s = self.scale
-            for C in self.ch_list:
-                g_raw = v[:, offset: offset + C]; offset += C
-                b_raw = v[:, offset: offset + C]; offset += C
-                g = s * g_raw
-                b = s * b_raw
-                gammas.append(g.view(B, C, 1, 1, 1))
-                betas.append(b.view(B, C, 1, 1, 1))
-            return gammas, betas
+            gamma = (s * g_raw).view(B, self.C, 1, 1, 1)
+            beta = (s * b_raw).view(B, self.C, 1, 1, 1)
+            return gamma, beta
 
-    class CNN3D_FiLM(nn.Module):
+    class CNN3D_FiLM_BottleneckOnly(nn.Module):
         def __init__(self):
             super().__init__()
             self.nx, self.ny, self.nz = nx, ny, nz
             self.depth = depth
             self.base_ch = base_ch
-            self.film_hidden = film_hidden
             self.film_scale = film_scale
-            self.film_mlp_dropout = film_mlp_dropout
 
-            # 固定输入：7 通道体素输入
             assert VOXEL_INPUT is not None, "VOXEL_INPUT 未初始化"
             self.register_buffer("voxel_input", VOXEL_INPUT)  # (1,7,nx,ny,nz)
 
-            # 监督/门控 mask：C0
             assert GEOM_MASK is not None, "GEOM_MASK 未初始化"
             self.register_buffer("geom_mask", GEOM_MASK)  # (1,1,nx,ny,nz)
 
-            # ===== full-res light block + MaxPool =====
+            # full-res light block + pooling
             c0 = max(8, base_ch // 2)
 
-            # Full-res "pre-encoder" block: (7 -> c0) at resolution /1
-            self.enc0_full = FiLMResidualBlock(7, c0, dropout_p=dropout_p)  # /1
+            self.enc0_full = ConvBlock(7, c0, dropout_p=dropout_p)  # /1
+            self.pool0 = nn.MaxPool3d(2, 2)
 
-            self.pool0 = nn.MaxPool3d(kernel_size=2, stride=2)  # /2
+            self.enc0 = ConvBlock(c0, base_ch, dropout_p=dropout_p)          # /2
+            self.pool1 = nn.MaxPool3d(2, 2)
+            self.enc1 = ConvBlock(base_ch, base_ch * 2, dropout_p=dropout_p) # /4
+            self.pool2 = nn.MaxPool3d(2, 2)
+            self.enc2 = ConvBlock(base_ch * 2, base_ch * 4, dropout_p=dropout_p)  # /8
 
-            # Encoder (depth=3)
-            self.enc0 = FiLMResidualBlock(c0, base_ch, dropout_p=dropout_p)  # /2
-            self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2)              # /4
-            self.enc1 = FiLMResidualBlock(base_ch, base_ch * 2, dropout_p=dropout_p)  # /4
-            self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)              # /8
-            self.enc2 = FiLMResidualBlock(base_ch * 2, base_ch * 4, dropout_p=dropout_p)  # /8
-
-            # Bottleneck
             bottleneck_ch = base_ch * 4
-            self.bottleneck = FiLMResidualBlock(bottleneck_ch, bottleneck_ch, dropout_p=dropout_p)  # /8
+            self.bottleneck = FiLMResidualBlock(bottleneck_ch, bottleneck_ch, dropout_p=dropout_p)
 
-            # Decoder
-            self.up2_conv = FiLMResidualBlock(bottleneck_ch + base_ch * 2, base_ch * 2, dropout_p=dropout_p)  # /4
-            self.up1_conv = FiLMResidualBlock(base_ch * 2 + base_ch, base_ch, dropout_p=dropout_p)            # /2
-
+            self.up2_conv = ConvBlock(bottleneck_ch + base_ch * 2, base_ch * 2, dropout_p=dropout_p)  # /4
+            self.up1_conv = ConvBlock(base_ch * 2 + base_ch, base_ch, dropout_p=dropout_p)            # /2
             self.out_proj = nn.Conv3d(base_ch, base_ch, kernel_size=1)
 
-            # /2 -> /1
-            self.up0_conv = FiLMResidualBlock(base_ch + c0, c0, dropout_p=dropout_p)  # /1
+            self.up0_conv = ConvBlock(base_ch + c0, c0, dropout_p=dropout_p)  # /1
             self.final_conv = nn.Conv3d(c0, 1, kernel_size=1)
 
-            # ===== FiLM injection channel list (must match forward order) =====
-            ch_list = [
-                c0,           # enc0_full
-                base_ch,      # enc0
-                base_ch * 2,  # enc1
-                base_ch * 4,  # enc2
-                base_ch * 4,  # bottleneck
-                base_ch * 2,  # up2
-                base_ch,      # up1
-                c0,           # up0
-            ]
-            self.film = FiLMGen(
-                input_dim=input_dim,
-                ch_list=ch_list,
-                hidden=film_hidden,
-                scale=film_scale,
-                mlp_dropout=film_mlp_dropout,
-            )
+            self.film = FiLMGen(input_dim=input_dim, C=bottleneck_ch, scale=film_scale)
 
         def forward(self, bc: torch.Tensor) -> torch.Tensor:
             B = bc.size(0)
-            vox = self.voxel_input.expand(B, -1, -1, -1, -1)  # (B,7,nx,ny,nz)
-            mask = self.geom_mask.expand(B, -1, -1, -1, -1)   # (B,1,nx,ny,nz)
+            vox = self.voxel_input.expand(B, -1, -1, -1, -1)
+            mask = self.geom_mask.expand(B, -1, -1, -1, -1)
 
-            gammas, betas = self.film(bc)
-            gi = 0
+            x_full_skip = self.enc0_full(vox)   # /1
+            x = self.pool0(x_full_skip)         # /2
 
-            # /1
-            x_full_skip = self.enc0_full(vox, gammas[gi], betas[gi]); gi += 1
-
-            # /2
-            x = self.pool0(x_full_skip)
-
-            # /2
-            x0 = self.enc0(x, gammas[gi], betas[gi]); gi += 1
-            # /4
+            x0 = self.enc0(x)                   # /2
             x1 = self.pool1(x0)
-            x1 = self.enc1(x1, gammas[gi], betas[gi]); gi += 1
-            # /8
+            x1 = self.enc1(x1)                  # /4
             x2 = self.pool2(x1)
-            x2 = self.enc2(x2, gammas[gi], betas[gi]); gi += 1
+            x2 = self.enc2(x2)                  # /8
 
-            # /8
-            xb = self.bottleneck(x2, gammas[gi], betas[gi]); gi += 1
+            gamma, beta = self.film(bc)
+            xb = self.bottleneck(x2, gamma, beta)
 
-            # /4
             x_up2 = F.interpolate(xb, size=x1.shape[2:], mode="trilinear", align_corners=False)
-            x_dec2 = self.up2_conv(torch.cat([x_up2, x1], dim=1), gammas[gi], betas[gi]); gi += 1
+            x_dec2 = self.up2_conv(torch.cat([x_up2, x1], dim=1))
 
-            # /2
             x_up1 = F.interpolate(x_dec2, size=x0.shape[2:], mode="trilinear", align_corners=False)
-            x_dec1 = self.up1_conv(torch.cat([x_up1, x0], dim=1), gammas[gi], betas[gi]); gi += 1
+            x_dec1 = self.up1_conv(torch.cat([x_up1, x0], dim=1))
 
             x_dec = self.out_proj(x_dec1)
 
-            # /1
             x_up0 = F.interpolate(x_dec, size=x_full_skip.shape[2:], mode="trilinear", align_corners=False)
-            x0_full = self.up0_conv(torch.cat([x_up0, x_full_skip], dim=1), gammas[gi], betas[gi]); gi += 1
+            x0_full = self.up0_conv(torch.cat([x_up0, x_full_skip], dim=1))
+            x_full = self.final_conv(x0_full)
 
-            x_full = self.final_conv(x0_full)  # (B,1,nx,ny,nz)
             out = x_full.squeeze(1)
             out = out * mask.squeeze(1)
             return out
 
-    return CNN3D_FiLM().to(device)
+    return CNN3D_FiLM_BottleneckOnly().to(device)
 
 
 # =============================================================
-# 保留 trial 版本（search 用），但内部只负责采样 -> params -> from_params
+# 保留 trial 版本（search 用）：采样 -> params -> from_params
 # =============================================================
 def create_cnn3d_from_trial(trial: optuna.trial.Trial, input_dim: int, nx: int, ny: int, nz: int) -> nn.Module:
     params = {
         "dropout_p": trial.suggest_float("dropout_p", 0.0, 0.3),
         "film_scale": trial.suggest_float("film_scale", 0.1, 2.0, log=True),
-        "film_mlp_dropout": trial.suggest_float("film_mlp_dropout", 0.0, 0.1),
-        # film_hidden 你原来固定 96，这里也固定；如果未来想搜，再改成 suggest_int
-        "film_hidden": 96,
     }
     return create_cnn3d_from_params(params, input_dim, nx, ny, nz)
 
@@ -366,7 +342,6 @@ for i in range(df_vox.shape[0]):
 geom_mask_np = (voxel_grid[0] > 0.5).astype(np.float32)
 GEOM_MASK = torch.tensor(geom_mask_np[None, None, ...], dtype=torch.float32, device=device)
 VOXEL_INPUT = torch.tensor(voxel_grid[None, ...], dtype=torch.float32, device=device)
-
 print(f"全局 C0(inside_mask) 占比: {geom_mask_np.mean() * 100:.3f}%")
 
 # 温度
@@ -413,7 +388,7 @@ else:
 
 print(f"训练集数量: {len(train_idx)}, 验证集数量: {len(val_idx)}, 测试集数量: {len(test_idx_final)}")
 
-# 标准化：X 用 StandardScaler；Y 做样本级 Z-score（仅在 mask==1 点上）
+# 标准化：X 用 StandardScaler；Y 做样本级 Z-score（仅 mask==1 点上）
 scaler_x = StandardScaler()
 X_scaled = scaler_x.fit_transform(X_data)
 
@@ -447,7 +422,7 @@ input_dim = x_train.shape[1]
 print(f"训练样本数: {x_train.shape[0]}, 验证样本数: {x_val.shape[0]}, 测试样本数: {x_test.shape[0]}")
 print(f"输入维度: {input_dim}")
 
-# Build dataset tensors ONCE (CPU)
+# tensors on CPU
 x_train_t = torch.from_numpy(x_train).to(torch.float32)
 y_train_t = torch.from_numpy(y_train).to(torch.float32)
 m_train_t = torch.from_numpy(mask_train).to(torch.float32)
@@ -460,16 +435,46 @@ x_test_t = torch.from_numpy(x_test).to(torch.float32)
 y_test_t = torch.from_numpy(y_test).to(torch.float32)
 m_test_t = torch.from_numpy(mask_test).to(torch.float32)
 
-PIN_MEMORY = (device.type == "cuda")
-
 
 # =============================================================
-# Masked Loss
+# Loss
 # =============================================================
 def masked_loss(pred, target, mask):
     per_elem = F.smooth_l1_loss(pred, target, reduction="none")
     masked = per_elem * mask
     return masked.sum() / (mask.sum() + 1e-8)
+
+
+# =============================================================
+# LR schedule helpers
+# =============================================================
+def set_group_lrs(optimizer, lr_backbone: float, film_lr_mult: float):
+    optimizer.param_groups[0]["lr"] = float(lr_backbone)
+    optimizer.param_groups[1]["lr"] = float(lr_backbone) * float(film_lr_mult)
+
+
+def backbone_cosine_lr(
+    epoch: int,
+    total_epochs: int,
+    warmup_epochs: int,
+    lr_max: float,
+    lr_init: float,
+    eta_min: float,
+) -> float:
+    """
+    Backbone LR schedule:
+    - warmup_epochs: linear lr_init -> lr_max
+    - cosine: lr_max -> eta_min   (NOT to 0)
+      lr = eta_min + (lr_max - eta_min) * 0.5 * (1 + cos(pi * t))
+    """
+    if epoch < warmup_epochs:
+        t = float(epoch + 1) / float(max(1, warmup_epochs))
+        return lr_init + (lr_max - lr_init) * t
+
+    e = epoch - warmup_epochs
+    T = max(1, total_epochs - warmup_epochs)
+    t = float(e) / float(T)
+    return float(eta_min) + (float(lr_max) - float(eta_min)) * 0.5 * (1.0 + math.cos(math.pi * t))
 
 
 # =============================================================
@@ -508,7 +513,6 @@ def objective(trial):
         generator=g_trial,
         pin_memory=PIN_MEMORY,
     )
-
     val_loader = DataLoader(
         TensorDataset(x_val_t, y_val_t, m_val_t),
         batch_size=BATCH_SIZE,
@@ -516,7 +520,7 @@ def objective(trial):
         pin_memory=PIN_MEMORY,
     )
 
-    # -------- EMA selection + EMA early stop --------
+    # -------- EMA selection + EMA early stop (match FiLM version) --------
     alpha = float(os.environ.get("VAL_EMA_ALPHA", "0.30"))  # 0.2~0.4 常用
     min_delta = 1e-6
     patience = 30
@@ -525,13 +529,12 @@ def objective(trial):
     best_ema = float("inf")
     val_ema = None
 
-    # -------- LR schedule for search --------
-    # objective 跑 80 epoch：warmup 取 min(WARMUP_EPOCHS, 10) 比较合理
-    total_epochs = 80
+    # -------- LR schedule for search (match FiLM version) --------
+    total_epochs = int(SEARCH_EPOCHS)
     warmup_epochs = min(int(WARMUP_EPOCHS), 20)
     lr_init = lr_max * 0.1
 
-    # eta_min = lr_max * 1e-2 (默认) 或 1e-3（可用环境变量调）
+    # eta_min = lr_max * 1e-2 (default) or 1e-3 via env
     eta_ratio = float(os.environ.get("ETA_MIN_RATIO", "1e-2"))
     eta_min = lr_max * eta_ratio
 
@@ -562,14 +565,14 @@ def objective(trial):
 
         # ---- val ----
         model.eval()
-        val_loss_total = 0.0
+        vtot = 0.0
         with torch.no_grad():
             for xb, yb, mb in val_loader:
                 xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
                 pred = model(xb)
                 vloss = masked_loss(pred, yb, mb)
-                val_loss_total += vloss.item() * xb.size(0)
-        val_loss = val_loss_total / len(val_loader.dataset)
+                vtot += vloss.item() * xb.size(0)
+        val_loss = vtot / len(val_loader.dataset)
 
         # ---- EMA update ----
         if val_ema is None:
@@ -592,42 +595,14 @@ def objective(trial):
 
     return float(best_ema)
 
+
 # =============================================================
-# 单次训练（固定超参 + 单 seed），并返回汇总信息
+# 单次训练（固定超参 + 单 seed）：单阶段 fixed-budget，保存 best+last
 # =============================================================
-def set_group_lrs(optimizer, lr_backbone: float, film_lr_mult: float):
-    optimizer.param_groups[0]["lr"] = float(lr_backbone)
-    optimizer.param_groups[1]["lr"] = float(lr_backbone) * float(film_lr_mult)
-
-
-def backbone_cosine_lr(
-    epoch: int,
-    total_epochs: int,
-    warmup_epochs: int,
-    lr_max: float,
-    lr_init: float,
-    eta_min: float,
-) -> float:
-    """
-    Backbone LR schedule:
-    - warmup_epochs: linear lr_init -> lr_max
-    - cosine: lr_max -> eta_min   (NOT to 0)
-      lr = eta_min + (lr_max - eta_min) * 0.5 * (1 + cos(pi * t))
-    """
-    if epoch < warmup_epochs:
-        t = float(epoch + 1) / float(max(1, warmup_epochs))
-        return lr_init + (lr_max - lr_init) * t
-
-    e = epoch - warmup_epochs
-    T = max(1, total_epochs - warmup_epochs)
-    t = float(e) / float(T)
-    return float(eta_min) + (float(lr_max) - float(eta_min)) * 0.5 * (1.0 + math.cos(math.pi * t))
-
 def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
     # ✅ 训练阶段随机性只来自这个 seed
     set_seed(seed)
 
-    # model
     model = create_cnn3d_from_params(best_params, input_dim, nx, ny, nz)
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
@@ -659,7 +634,6 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
         generator=g_train,
         pin_memory=PIN_MEMORY,
     )
-
     val_loader = DataLoader(
         TensorDataset(x_val_t, y_val_t, m_val_t),
         batch_size=BATCH_SIZE,
@@ -667,27 +641,32 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
         pin_memory=PIN_MEMORY,
     )
 
-    # ---- LR schedule params ----
+    # ---- LR schedule params (match FiLM version) ----
     lr_init = lr_max * 0.1
-    eta_ratio = float(os.environ.get("ETA_MIN_RATIO", "1e-2"))  # 1e-2 or 1e-3
+    eta_ratio = float(os.environ.get("ETA_MIN_RATIO", "1e-2"))  # ✅ env override
     eta_min = lr_max * eta_ratio
 
     # init lr for warmup start
     set_group_lrs(optimizer, lr_backbone=lr_init, film_lr_mult=film_lr_mult)
 
-    # ---- EMA selection params ----
+    # ---- EMA selection params (match FiLM version) ----
     alpha = float(os.environ.get("VAL_EMA_ALPHA", "0.30"))
     min_delta = 1e-6
 
     best_ema = float("inf")
     best_epoch = -1
-    best_val_at_best = float("inf")  # 记录 best_epoch 对应 raw val_loss（便于读日志）
+    best_val_at_best = float("inf")
     val_ema = None
+
     best_state = None
+    last_state = None
 
     model_core = model.module if isinstance(model, nn.DataParallel) else model
 
-    print(f"\n===== Train seed={seed} | fixed-budget={TOTAL_EPOCHS} | eta_min={eta_min:.3e} (ratio={eta_ratio:g}) =====")
+    print(
+        f"\n===== Train seed={seed} | fixed-budget={TOTAL_EPOCHS} | "
+        f"eta_min={eta_min:.3e} (ratio={eta_ratio:g}) ====="
+    )
 
     last_val = float("nan")
     last_ema = float("nan")
@@ -698,15 +677,12 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
         run = 0.0
         for xb, yb, mb in train_loader:
             xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
-
             optimizer.zero_grad(set_to_none=True)
             pred = model(xb)
             loss = masked_loss(pred, yb, mb)
             loss.backward()
             optimizer.step()
-
             run += loss.item() * xb.size(0)
-
         train_loss = run / len(train_loader.dataset)
 
         # ---- lr step (warmup->cosine->eta_min) ----
@@ -747,6 +723,10 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
             best_val_at_best = float(val_loss)
             best_state = {k: v.detach().cpu().clone() for k, v in model_core.state_dict().items()}
 
+        # ---- always keep last ----
+        if epoch == TOTAL_EPOCHS - 1:
+            last_state = {k: v.detach().cpu().clone() for k, v in model_core.state_dict().items()}
+
         if epoch % 10 == 0 or epoch == TOTAL_EPOCHS - 1:
             print(
                 f"[seed={seed}] Epoch {epoch:03d}, lr_bb={lr_backbone:.3e}, "
@@ -758,25 +738,25 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
     if best_state is None:
         raise RuntimeError("训练结束但 best_state 为空（不应发生）。")
 
-    # -------------------- Save LAST checkpoint (current weights) --------------------
+    # -------------------- Save LAST checkpoint --------------------
     last_ckpt_path = f"{CKPT_PREFIX}_seed{seed}_last.pth"
     torch.save(
         {
-            "state_dict": model_core.state_dict(),  # 当前就是 last
+            "state_dict": model_core.state_dict(),
             "input_dim": input_dim,
             "nx": nx, "ny": ny, "nz": nz,
             "depth": 3,
             "base_ch": 24,
             "dropout_p": float(best_params.get("dropout_p", 0.1)),
-            "model_type": "FiLM_A_voxel7_no_stem_pooldown_fullres_light",
-            "film_hidden": int(best_params.get("film_hidden", 96)),
+            "model_type": "FiLM_bottleneck_only_linear_voxel7_no_stem_pooldown_fullres_light",
+            "film_injection": "bottleneck_only",
+            "film_gen": "linear",
             "film_scale": float(best_params.get("film_scale", 1.0)),
-            "film_mlp_dropout": float(best_params.get("film_mlp_dropout", 0.0)),
             "film_lr_mult": float(best_params.get("film_lr_mult", 1.0)),
             "lr": float(best_params.get("lr", 1e-3)),
-            "eta_min_ratio": float(eta_ratio),
+            "eta_min_ratio": float(ETA_MIN_RATIO),
             "eta_min": float(eta_min),
-            "val_ema_alpha": float(alpha),
+            "val_ema_alpha": float(VAL_EMA_ALPHA),
             "x_mean": scaler_x.mean_,
             "x_scale": scaler_x.scale_,
             "Y_means": Y_means,
@@ -797,7 +777,7 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
     )
     print(f"[seed={seed}] Saved LAST  ckpt: {last_ckpt_path}")
 
-    # -------------------- Save BEST checkpoint (EMA-best) --------------------
+    # -------------------- Save BEST checkpoint --------------------
     model_core.load_state_dict(best_state, strict=True)
 
     best_ckpt_path = f"{CKPT_PREFIX}_seed{seed}_best.pth"
@@ -809,15 +789,15 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
             "depth": 3,
             "base_ch": 24,
             "dropout_p": float(best_params.get("dropout_p", 0.1)),
-            "model_type": "FiLM_A_voxel7_no_stem_pooldown_fullres_light",
-            "film_hidden": int(best_params.get("film_hidden", 96)),
+            "model_type": "FiLM_bottleneck_only_linear_voxel7_no_stem_pooldown_fullres_light",
+            "film_injection": "bottleneck_only",
+            "film_gen": "linear",
             "film_scale": float(best_params.get("film_scale", 1.0)),
-            "film_mlp_dropout": float(best_params.get("film_mlp_dropout", 0.0)),
             "film_lr_mult": float(best_params.get("film_lr_mult", 1.0)),
             "lr": float(best_params.get("lr", 1e-3)),
-            "eta_min_ratio": float(eta_ratio),
+            "eta_min_ratio": float(ETA_MIN_RATIO),
             "eta_min": float(eta_min),
-            "val_ema_alpha": float(alpha),
+            "val_ema_alpha": float(VAL_EMA_ALPHA),
             "x_mean": scaler_x.mean_,
             "x_scale": scaler_x.scale_,
             "Y_means": Y_means,
@@ -840,7 +820,6 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
     print(f"[seed={seed}] best_epoch(EMA)={best_epoch} | best_ema={best_ema:.6f} | val@best={best_val_at_best:.6f}")
     print(f"[seed={seed}] last_epoch={TOTAL_EPOCHS - 1} | last_val={last_val:.6f} | last_ema={last_ema:.6f}")
 
-    # cleanup
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -855,9 +834,10 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
         "last_val_ema": float(last_ema),
         "ckpt_best_path": best_ckpt_path,
         "ckpt_last_path": last_ckpt_path,
-        "eta_min_ratio": float(eta_ratio),
-        "val_ema_alpha": float(alpha),
+        "eta_min_ratio": float(ETA_MIN_RATIO),
+        "val_ema_alpha": float(VAL_EMA_ALPHA),
     }
+
 
 # =============================================================
 # 主流程：search or train-only + multi-seed training + summary
@@ -865,35 +845,34 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
 print("\n=============================================================")
 print(f"RUN_MODE={RUN_MODE} | BEST_PARAMS_PATH={BEST_PARAMS_PATH}")
 print(f"SEARCH_SEED={SEARCH_SEED} | SEEDS={SEEDS}")
-print(f"N_TRIALS={N_TRIALS} | TOTAL_EPOCHS={TOTAL_EPOCHS} | WARMUP_EPOCHS={WARMUP_EPOCHS} | BATCH_SIZE={BATCH_SIZE}")
+print(f"N_TRIALS={N_TRIALS} | SEARCH_EPOCHS={SEARCH_EPOCHS}")
+print(f"TOTAL_EPOCHS={TOTAL_EPOCHS} | WARMUP_EPOCHS={WARMUP_EPOCHS} | BATCH_SIZE={BATCH_SIZE}")
+print(f"VAL_EMA_ALPHA={VAL_EMA_ALPHA} | ETA_MIN_RATIO={ETA_MIN_RATIO}")
 print("=============================================================\n")
 
 if RUN_MODE not in ("search", "train"):
     raise ValueError('RUN_MODE must be "search" or "train"')
 
 if RUN_MODE == "search":
-    # ✅ search 使用固定 SEARCH_SEED，确保可比
     set_seed(SEARCH_SEED)
-    print("开始 Optuna 超参搜索（FiLM/结构 + lr）...")
+    print("开始 Optuna 超参搜索（FiLM bottleneck-only + lr）...")
     sampler = optuna.samplers.TPESampler(seed=SEARCH_SEED)
     study = optuna.create_study(direction="minimize", sampler=sampler)
     study.optimize(objective, n_trials=N_TRIALS)
+
     best_params = dict(study.best_params)
-
-    # 把固定常数也写入 params，确保 train-only 完整复现
-    best_params["film_hidden"] = 96
-
+    # 重要：把 lr / film_lr_mult 一起纳入 best_params 供 train-only 使用
+    # (study.best_params 已含 lr / film_lr_mult / dropout_p / film_scale)
     print("最佳参数:", best_params)
     save_best_params(best_params, BEST_PARAMS_PATH)
-    if not TRAIN_AFTER_SEARCH:
-        print("TRAIN_AFTER_SEARCH=0, skip training.")
-        raise SystemExit(0)
     print("best_params saved to:", BEST_PARAMS_PATH)
 else:
+    if not os.path.exists(BEST_PARAMS_PATH):
+        raise FileNotFoundError(f"BEST_PARAMS_PATH not found: {BEST_PARAMS_PATH}. Run RUN_MODE=search first.")
     best_params = load_best_params(BEST_PARAMS_PATH)
     print("Loaded best_params:", best_params)
 
-# ✅ 5) 多 seed 训练 + 汇总
+# 多 seed 训练 + 汇总
 results = []
 for s in SEEDS:
     r = train_one_seed(best_params, seed=int(s))
@@ -905,13 +884,23 @@ print("\n===== Seed summary =====")
 print(df_sum)
 print(f"Saved summary CSV: {SUMMARY_CSV_PATH}")
 
-# 先跑一次 Optuna 搜索 + 自动保存 best_params_film_allBlock.json，再用默认 SEED=43 训练
-# RUN_MODE=search N_TRIALS=20 SEARCH_SEED=42 SEED=43 python CNN_FiLM_sdf+bm_GN_RemoveStem.py
-# 只训练（train-only），不做任何超参搜索：读取 best_params_film.json
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_film_allBlock.json SEED=43 python CNN_FiLM_sdf+bm_GN_RemoveStem.py
-# 同一份超参，跑一组 seeds，并输出 seed_summary_film_allBlock.csv（推荐你做鲁棒性）
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_film_allBlock.json SEEDS="42,43,44,45,46" python CNN_FiLM_sdf+bm_GN_RemoveStem.py
-# 你想固定训练预算/批量大小（都只影响训练，不影响 search）
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_film_allBlock.json SEEDS="42,43,44" TOTAL_EPOCHS=500 WARMUP_EPOCHS=20 BATCH_SIZE=16 python CNN_FiLM_sdf+bm_GN_RemoveStem.py
-# （如果你加了 TRAIN_AFTER_SEARCH 开关）只搜索不训练
-# RUN_MODE=search TRAIN_AFTER_SEARCH=0 SEARCH_SEED=42 N_TRIALS=20 BEST_PARAMS_PATH=best_params_film_allBlock.json python CNN_FiLM_sdf+bm_GN_RemoveStem.py
+# =============================================================
+# 命令行用法（示例）
+# =============================================================
+# 1) 搜索 + 训练一个 seed（默认 SEED=43）
+# RUN_MODE=search N_TRIALS=20 SEARCH_SEED=42 SEED=43 python CNN_FiLM_sdf+bm_GN_RemoveStem_Bottleneck.py
+#
+# 2) 只训练（train-only）
+# RUN_MODE=train BEST_PARAMS_PATH=best_params_film_bottleneck.json SEED=43 python CNN_FiLM_sdf+bm_GN_RemoveStem_Bottleneck.py
+#
+# 3) 同一份超参跑一组 seeds
+# RUN_MODE=train BEST_PARAMS_PATH=best_params_film_bottleneck.json SEEDS="42,43,44,45,46" python CNN_FiLM_sdf+bm_GN_RemoveStem_Bottleneck.py
+#
+# 4) 固定预算 / warmup / batch（只影响训练，不影响 search）
+# RUN_MODE=train BEST_PARAMS_PATH=best_params_film_bottleneck.json SEEDS="42,43,44" TOTAL_EPOCHS=300 WARMUP_EPOCHS=20 BATCH_SIZE=16 python CNN_FiLM_sdf+bm_GN_RemoveStem_Bottleneck.py
+#
+# 5) 自定义 ckpt 前缀与汇总表路径
+# RUN_MODE=train BEST_PARAMS_PATH=best_params_film_bottleneck.json SEEDS="42,43" CKPT_PREFIX="ckpt/CNN_Concat" SUMMARY_CSV="ckpt/seed_summary_film_bottleneck.csv" CNN_FiLM_sdf+bm_GN_RemoveStem_Bottleneck.py
+#
+# 6) 只搜索不训练
+# RUN_MODE=search TRAIN_AFTER_SEARCH=0 SEARCH_SEED=42 N_TRIALS=20 BEST_PARAMS_PATH=best_params_cnn_concat.json python CNN_FiLM_sdf+bm_GN_RemoveStem_Bottleneck.py

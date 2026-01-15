@@ -68,7 +68,7 @@ MIN_DELTA = float(os.environ.get("MIN_DELTA", "1e-6"))          # 默认 1e-6
 # lr_min hold（可选）
 LR_MIN_HOLD_EPOCHS = int(os.environ.get("LR_MIN_HOLD_EPOCHS", "0"))
 
-SUMMARY_CSV_PATH = os.environ.get("SUMMARY_CSV", "seed_summary.csv")
+SUMMARY_CSV_PATH = os.environ.get("SUMMARY_CSV", "seed_summary_cnn_concat.csv")
 CKPT_PREFIX = os.environ.get("CKPT_PREFIX", "best_CNN_Concat_sdf+bm_GN_RemoveStem")
 
 
@@ -478,7 +478,7 @@ def objective(trial: optuna.trial.Trial) -> float:
 
     # -------- LR schedule for search --------
     total_epochs = 80
-    warmup_epochs = min(int(WARMUP_EPOCHS), 10)
+    warmup_epochs = min(int(WARMUP_EPOCHS), 20)
     lr_init = lr_max * 0.1
     eta_min = lr_max * 1e-2
     hold_epochs = 0
@@ -840,7 +840,7 @@ print(f"Saved summary CSV: {SUMMARY_CSV_PATH}")
 # RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEEDS="42,43,44" TOTAL_EPOCHS=300 WARMUP_EPOCHS=20 BATCH_SIZE=16 python CNN_Concat_sdf+bm_GN_RemoveStem.py
 #
 # 5) 自定义 ckpt 前缀与汇总表路径
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEEDS="42,43" CKPT_PREFIX="ckpt/CNN_Concat" SUMMARY_CSV="ckpt/seed_summary.csv" python CNN_Concat_sdf+bm_GN_RemoveStem.py
+# RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEEDS="42,43" CKPT_PREFIX="ckpt/CNN_Concat" SUMMARY_CSV="ckpt/seed_summary_cnn_concat.csv" python CNN_Concat_sdf+bm_GN_RemoveStem.py
 #
 # 6) 只搜索不训练
 # RUN_MODE=search TRAIN_AFTER_SEARCH=0 SEARCH_SEED=42 N_TRIALS=20 BEST_PARAMS_PATH=best_params_cnn_concat.json python CNN_Concat_sdf+bm_GN_RemoveStem.py
