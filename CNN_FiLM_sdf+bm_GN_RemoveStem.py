@@ -55,7 +55,7 @@ WARMUP_EPOCHS = int(os.environ.get("WARMUP_EPOCHS", "20"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 
 # 输出路径
-SUMMARY_CSV_PATH = os.environ.get("SUMMARY_CSV", "seed_summary.csv")
+SUMMARY_CSV_PATH = os.environ.get("SUMMARY_CSV", "seed_summary_film_allBlock.csv")
 
 # ckpt 命名前缀
 CKPT_PREFIX = os.environ.get("CKPT_PREFIX", "best_CNN_FiLM_sdf+bm_GN_RemoveStem")
@@ -904,13 +904,13 @@ df_sum.to_csv(SUMMARY_CSV_PATH, index=False, encoding="utf-8")
 print("\n===== Seed summary =====")
 print(df_sum)
 print(f"Saved summary CSV: {SUMMARY_CSV_PATH}")
-# 先跑一次 Optuna 搜索 + 自动保存 best_params_film.json，再用默认 SEED=43 训练
+# 先跑一次 Optuna 搜索 + 自动保存 best_params_film_allBlock.json，再用默认 SEED=43 训练
 # RUN_MODE=search N_TRIALS=20 SEARCH_SEED=42 SEED=43 python CNN_FiLM_sdf+bm_GN_RemoveStem.py
 # 只训练（train-only），不做任何超参搜索：读取 best_params_film.json
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_film.json SEED=43 python CNN_FiLM_sdf+bm_GN_RemoveStem.py
-# 同一份超参，跑一组 seeds，并输出 seed_summary.csv（推荐你做鲁棒性）
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_film.json SEEDS="42,43,44,45,46" python CNN_FiLM_sdf+bm_GN_RemoveStem.py
+# RUN_MODE=train BEST_PARAMS_PATH=best_params_film_allBlock.json SEED=43 python CNN_FiLM_sdf+bm_GN_RemoveStem.py
+# 同一份超参，跑一组 seeds，并输出 seed_summary_film_allBlock.csv（推荐你做鲁棒性）
+# RUN_MODE=train BEST_PARAMS_PATH=best_params_film_allBlock.json SEEDS="42,43,44,45,46" python CNN_FiLM_sdf+bm_GN_RemoveStem.py
 # 你想固定训练预算/批量大小（都只影响训练，不影响 search）
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_film.json SEEDS="42,43,44" TOTAL_EPOCHS=300 WARMUP_EPOCHS=20 BATCH_SIZE=16 python CNN_FiLM_sdf+bm_GN_RemoveStem.py
+# RUN_MODE=train BEST_PARAMS_PATH=best_params_film_allBlock.json SEEDS="42,43,44" TOTAL_EPOCHS=300 WARMUP_EPOCHS=20 BATCH_SIZE=16 python CNN_FiLM_sdf+bm_GN_RemoveStem.py
 # （如果你加了 TRAIN_AFTER_SEARCH 开关）只搜索不训练
-# RUN_MODE=search TRAIN_AFTER_SEARCH=0 SEARCH_SEED=42 N_TRIALS=20 BEST_PARAMS_PATH=best_params_film.json python CNN_FiLM_sdf+bm_GN_RemoveStem.py
+# RUN_MODE=search TRAIN_AFTER_SEARCH=0 SEARCH_SEED=42 N_TRIALS=20 BEST_PARAMS_PATH=best_params_film_allBlock.json python CNN_FiLM_sdf+bm_GN_RemoveStem.py
