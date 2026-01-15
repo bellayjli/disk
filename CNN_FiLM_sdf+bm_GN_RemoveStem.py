@@ -904,6 +904,7 @@ df_sum.to_csv(SUMMARY_CSV_PATH, index=False, encoding="utf-8")
 print("\n===== Seed summary =====")
 print(df_sum)
 print(f"Saved summary CSV: {SUMMARY_CSV_PATH}")
+
 # 先跑一次 Optuna 搜索 + 自动保存 best_params_film_allBlock.json，再用默认 SEED=43 训练
 # RUN_MODE=search N_TRIALS=20 SEARCH_SEED=42 SEED=43 python CNN_FiLM_sdf+bm_GN_RemoveStem.py
 # 只训练（train-only），不做任何超参搜索：读取 best_params_film.json
