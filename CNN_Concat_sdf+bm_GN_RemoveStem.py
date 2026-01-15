@@ -3,19 +3,20 @@
 # =============================================================
 # CNN.py —— 边界条件 → 3D 温度场（Concat BC as voxel channels）
 #
-# 改造点（同 FiLM 版本）：
-# 1) trial -> params: create_cnn3d_from_params(params, ...)
-# 2) best_params 落盘 JSON
-# 3) RUN_MODE: search vs train-only
-# 4) 多 seed 只影响训练阶段：search 用 SEARCH_SEED 固定；train 用 SEEDS
-# 5) 同一份超参跑一组 seeds，并输出汇总 seed_summary_cnn_concat.csv
+# 改造点（同 FiLM 版本口径）：
+# 1) best selection: 用 val_ema（验证损失 EMA），EMA 形式：val_ema = alpha*val + (1-alpha)*val_ema
+# 2) objective：best selection + early stopping 都基于 val_ema（与 FiLM 逐行同款写法）
+# 3) train_one_seed：固定预算（不 early stop），best selection 基于 val_ema（与 FiLM 口径一致）
+# 4) LR：warmup → cosine decay → eta_min（可选 hold），公式同 FiLM：
+#       lr = eta_min + (lr_max - eta_min) * 0.5 * (1 + cos(...))
+# 5) 同时保存 last checkpoint + best checkpoint，并统一日志字段名：best_ema / val_ema
 # =============================================================
 
 import os
 import json
 import random
 import math
-from typing import Dict, Any, List,Optional
+from typing import Dict, Any, List, Optional
 
 import optuna
 import numpy as np
@@ -40,48 +41,39 @@ os.environ.setdefault("TMP", "/dev/shm")
 # 运行模式 / 配置（环境变量）
 # =============================================================
 RUN_MODE = os.environ.get("RUN_MODE", "search").strip().lower()  # "search" or "train"
-TRAIN_AFTER_SEARCH = os.environ.get("TRAIN_AFTER_SEARCH", "1").strip() not in ("0", "false", "no")
+TRAIN_AFTER_SEARCH = os.environ.get("TRAIN_AFTER_SEARCH", "1").strip().lower() not in ("0", "false", "no")
 BEST_PARAMS_PATH = os.environ.get("BEST_PARAMS_PATH", "best_params_cnn_concat.json")
 
-# Search 阶段固定 seed（保证 trial 可比；换训练 seed 不会影响搜索）
 SEARCH_SEED = int(os.environ.get("SEARCH_SEED", "42"))
 
-# 训练阶段 seed 列表（只影响训练）
-# 用法：SEEDS="42,43,44,45,46"
 SEEDS_ENV = os.environ.get("SEEDS", "").strip()
 if SEEDS_ENV:
     SEEDS: List[int] = [int(s) for s in SEEDS_ENV.split(",") if s.strip() != ""]
 else:
-    # 兼容：如果你只想跑一个 seed，可以用 SEED=43
     SEEDS = [int(os.environ.get("SEED", "43"))]
 
-# Optuna trials
 N_TRIALS = int(os.environ.get("N_TRIALS", "20"))
 
-# 固定训练预算（你的单阶段 fixed-budget 逻辑）
 TOTAL_EPOCHS = int(os.environ.get("TOTAL_EPOCHS", "300"))
 WARMUP_EPOCHS = int(os.environ.get("WARMUP_EPOCHS", "20"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 
-# EMA / early stop
-VAL_EMA_DECAY = float(os.environ.get("VAL_EMA_DECAY", "0.9"))          # e.g. 0.9 / 0.95
-MIN_DELTA = float(os.environ.get("MIN_DELTA", "1e-6"))
-PATIENCE_SEARCH = int(os.environ.get("PATIENCE_SEARCH", "30"))         # objective 内的 early stop
-PATIENCE_TRAIN = int(os.environ.get("PATIENCE_TRAIN", "30"))           # train_one_seed 的 early stop
-MIN_EPOCHS_BEFORE_STOP = int(os.environ.get("MIN_EPOCHS_BEFORE_STOP", "0"))  # e.g. 0 / WARMUP_EPOCHS
+# EMA（与 FiLM 口径一致：alpha = 新值权重）
+VAL_EMA_ALPHA = float(os.environ.get("VAL_EMA_ALPHA", "0.30"))  # 0.2~0.4 常用
 
-# lr_min hold（可选）：warmup + cosine 到 eta_min 之后，再保持 eta_min 若干 epoch
-LR_MIN_HOLD_EPOCHS = int(os.environ.get("LR_MIN_HOLD_EPOCHS", "0"))    # 默认 0（纯 warmup+cosine）
+# 目标函数 early stop（与 FiLM 同款写法：patience=30 / min_delta=1e-6）
+PATIENCE_SEARCH = int(os.environ.get("PATIENCE_SEARCH", "30"))  # 默认 30
+MIN_DELTA = float(os.environ.get("MIN_DELTA", "1e-6"))          # 默认 1e-6
 
-# 输出路径
+# lr_min hold（可选）
+LR_MIN_HOLD_EPOCHS = int(os.environ.get("LR_MIN_HOLD_EPOCHS", "0"))
+
 SUMMARY_CSV_PATH = os.environ.get("SUMMARY_CSV", "seed_summary.csv")
-
-# ckpt 命名前缀
 CKPT_PREFIX = os.environ.get("CKPT_PREFIX", "best_CNN_Concat_sdf+bm_GN_RemoveStem")
 
 
 # =============================================================
-# 随机种子工具（训练阶段会反复调用；search 阶段也会固定调用）
+# 随机种子工具
 # =============================================================
 def set_seed(seed: int):
     random.seed(seed)
@@ -155,7 +147,7 @@ class ConvBlock(nn.Module):
 
 
 # =============================================================
-# ✅ 1) 模型构建：from params（不依赖 optuna trial）
+# ✅ 模型构建：from params（不依赖 optuna trial）
 # =============================================================
 def create_cnn3d_from_params(params: Dict[str, Any], input_dim: int, nx: int, ny: int, nz: int) -> nn.Module:
     """
@@ -181,7 +173,6 @@ def create_cnn3d_from_params(params: Dict[str, Any], input_dim: int, nx: int, ny
             self.register_buffer("geom_mask", GEOM_MASK)  # (1,1,nx,ny,nz)
 
             in_ch_in = 13  # 7(voxel) + 6(bc)
-
             c0 = max(8, base_ch // 2)
 
             self.enc0_full = ConvBlock(in_ch_in, c0, dropout_p=dropout_p)  # /1
@@ -242,13 +233,8 @@ def create_cnn3d_from_params(params: Dict[str, Any], input_dim: int, nx: int, ny
     return CNN3D_NoFiLM().to(device)
 
 
-# =============================================================
-# 保留 trial 版本（search 用）：采样 -> params -> from_params
-# =============================================================
 def create_cnn3d_from_trial(trial: optuna.trial.Trial, input_dim: int, nx: int, ny: int, nz: int) -> nn.Module:
-    params = {
-        "dropout_p": trial.suggest_float("dropout_p", 0.0, 0.3),
-    }
+    params = {"dropout_p": trial.suggest_float("dropout_p", 0.0, 0.3)}
     return create_cnn3d_from_params(params, input_dim, nx, ny, nz)
 
 
@@ -265,7 +251,6 @@ for c in ["x", "y", "z", "C0"]:
     if c not in df_vox.columns:
         raise KeyError(f"{datapath_voxel} 缺少列: {c}")
 
-# 体素通道固定为：[C0,C1,C2,C3,C4,C5,sdf]
 voxel_cols = ["C0", "C1", "C2", "C3", "C4", "C5", "sdf"]
 missing_cols = [c for c in voxel_cols if c not in df_vox.columns]
 if missing_cols:
@@ -307,7 +292,6 @@ GEOM_MASK = torch.tensor(geom_mask_np[None, None, ...], dtype=torch.float32, dev
 VOXEL_INPUT = torch.tensor(voxel_grid[None, ...], dtype=torch.float32, device=device)
 print(f"全局 C0(inside_mask) 占比: {geom_mask_np.mean() * 100:.3f}%")
 
-# 温度
 T_np = pd.read_csv(datapath_temp).to_numpy(dtype=np.float32)
 num_points = int(df_vox.shape[0])
 
@@ -334,7 +318,6 @@ mask_valid = np.broadcast_to(geom_mask_np[None, ...], (num_samples, nx, ny, nz))
 lin_valid = np.where(geom_mask_np.reshape(-1) > 0.5)[0]
 print(f"真实点占比(由C0给定): {float(mask_valid.mean()) * 100:.3f}%")
 
-# 边界条件与 split
 df_bc = pd.read_csv(datapath_bc)
 X_data = df_bc.iloc[:, :6].to_numpy(dtype=np.float32)
 split_raw = df_bc.iloc[:, 6].to_numpy()
@@ -351,7 +334,6 @@ else:
 
 print(f"训练集数量: {len(train_idx)}, 验证集数量: {len(val_idx)}, 测试集数量: {len(test_idx_final)}")
 
-# 标准化：X 用 StandardScaler；Y 做样本级 Z-score（仅在 mask==1 点上）
 scaler_x = StandardScaler()
 X_scaled = scaler_x.fit_transform(X_data)
 
@@ -368,7 +350,6 @@ for i in range(num_samples):
     Y_scaled_flat = Y_scaled[i].reshape(-1)
     Y_scaled_flat[lin_valid] = (valid_i - m) / s
 
-# 切分
 x_train = X_scaled[train_idx]
 y_train = Y_scaled[train_idx]
 mask_train = mask_valid[train_idx]
@@ -385,7 +366,6 @@ input_dim = x_train.shape[1]
 print(f"训练样本数: {x_train.shape[0]}, 验证样本数: {x_val.shape[0]}, 测试样本数: {x_test.shape[0]}")
 print(f"输入维度: {input_dim}")
 
-# Build dataset tensors ONCE (CPU)
 x_train_t = torch.from_numpy(x_train).to(torch.float32)
 y_train_t = torch.from_numpy(y_train).to(torch.float32)
 m_train_t = torch.from_numpy(mask_train).to(torch.float32)
@@ -402,7 +382,7 @@ PIN_MEMORY = (device.type == "cuda")
 
 
 # =============================================================
-# Masked Loss（Huber / smooth_l1）
+# Masked Loss
 # =============================================================
 def masked_loss(pred, target, mask):
     per_elem = F.smooth_l1_loss(pred, target, reduction="none")
@@ -411,16 +391,8 @@ def masked_loss(pred, target, mask):
 
 
 # =============================================================
-# val EMA helpers
-# =============================================================
-def ema_update(prev: Optional[float], x: float, decay: float) -> float:
-    if prev is None or (isinstance(prev, float) and (not math.isfinite(prev))):
-        return float(x)
-    return float(decay) * float(prev) + (1.0 - float(decay)) * float(x)
-
-
-# =============================================================
 # LR schedule: warmup -> cosine to eta_min -> (optional) hold eta_min
+#   lr = eta_min + (lr_max - eta_min) * 0.5 * (1 + cos(pi * t))
 # =============================================================
 def lr_warmup_cosine_eta_min(
     epoch: int,
@@ -432,12 +404,6 @@ def lr_warmup_cosine_eta_min(
     eta_min: float,
     hold_epochs: int = 0,
 ) -> float:
-    """
-    - warmup: linear lr_init -> lr_max
-    - cosine: lr_max -> eta_min (with eta_min floor)
-      lr = eta_min + (lr_max - eta_min) * 0.5 * (1 + cos(pi * t))
-    - optional: last hold_epochs keep eta_min
-    """
     total_epochs = int(total_epochs)
     warmup_epochs = int(warmup_epochs)
     hold_epochs = int(max(0, hold_epochs))
@@ -445,21 +411,17 @@ def lr_warmup_cosine_eta_min(
     if total_epochs <= 0:
         return float(eta_min)
 
-    # clamp hold so we still have at least 1 cosine step if possible
     hold_epochs = min(hold_epochs, max(0, total_epochs - warmup_epochs - 1))
 
     if epoch < warmup_epochs:
         t = float(epoch + 1) / float(max(1, warmup_epochs))
         return float(lr_init + (lr_max - lr_init) * t)
 
-    # epochs remaining after warmup
     cosine_total = max(1, total_epochs - warmup_epochs - hold_epochs)
 
-    # if in hold region
     if epoch >= warmup_epochs + cosine_total:
         return float(eta_min)
 
-    # cosine region index
     e = epoch - warmup_epochs  # 0..cosine_total-1
     t = float(e) / float(cosine_total)  # [0,1)
     return float(eta_min + (lr_max - eta_min) * 0.5 * (1.0 + math.cos(math.pi * t)))
@@ -475,9 +437,9 @@ def set_optimizer_lr(optimizer: optim.Optimizer, lr_value: float) -> None:
 # Optuna objective（search 阶段固定 SEARCH_SEED）
 # - best selection: val_ema
 # - early stop: val_ema
+# - EMA 写法逐行对齐 FiLM 版本（不使用 helper）
 # =============================================================
 def objective(trial: optuna.trial.Trial) -> float:
-    # ✅ search 阶段固定住一切随机性（只让 trial 的 params 变化）
     set_seed(SEARCH_SEED)
 
     g_trial = torch.Generator()
@@ -497,6 +459,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         generator=g_trial,
         pin_memory=PIN_MEMORY,
     )
+
     val_loader = DataLoader(
         TensorDataset(x_val_t, y_val_t, m_val_t),
         batch_size=BATCH_SIZE,
@@ -504,150 +467,26 @@ def objective(trial: optuna.trial.Trial) -> float:
         pin_memory=PIN_MEMORY,
     )
 
-    # objective 训练预算（保持你原来的 80）
-    total_epochs = 80
-    warmup_epochs = min(10, total_epochs // 4)  # objective 内给个小 warmup（不影响 train-one-seed）
-    lr_init = lr_max * 0.1
-    eta_min = lr_max * 1e-2  # ✅ 经验值
-    hold_epochs = 0
-
-    best_ema = float("inf")
-    best_epoch = -1
-    val_ema: Optional[float] = None
+    # -------- EMA selection + EMA early stop (FiLM-style) --------
+    alpha = float(os.environ.get("VAL_EMA_ALPHA", "0.30"))  # 0.2~0.4 常用
+    min_delta = float(os.environ.get("MIN_DELTA", "1e-6"))
+    patience = int(os.environ.get("PATIENCE_SEARCH", "30"))
     no_improve = 0
 
-    for epoch in range(total_epochs):
-        # --- train ---
-        model.train()
-        for xb, yb, mb in train_loader:
-            xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            pred = model(xb)
-            loss = masked_loss(pred, yb, mb)
-            loss.backward()
-            optimizer.step()
+    best_ema = float("inf")
+    val_ema = None
 
-        # --- lr step ---
-        lr = lr_warmup_cosine_eta_min(
-            epoch=epoch,
-            total_epochs=total_epochs,
-            warmup_epochs=warmup_epochs,
-            lr_max=lr_max,
-            lr_init=lr_init,
-            eta_min=eta_min,
-            hold_epochs=hold_epochs,
-        )
-        set_optimizer_lr(optimizer, lr)
-
-        # --- val ---
-        model.eval()
-        vtot = 0.0
-        with torch.no_grad():
-            for xb, yb, mb in val_loader:
-                xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
-                pred = model(xb)
-                vloss = masked_loss(pred, yb, mb)
-                vtot += vloss.item() * xb.size(0)
-
-        val_loss = float(vtot / len(val_loader.dataset))
-        val_ema = ema_update(val_ema, val_loss, decay=VAL_EMA_DECAY)
-
-        # --- best/early stop based on EMA ---
-        if val_ema < best_ema - MIN_DELTA:
-            best_ema = float(val_ema)
-            best_epoch = int(epoch)
-            no_improve = 0
-        else:
-            no_improve += 1
-            if no_improve >= PATIENCE_SEARCH:
-                break
-
-    del model
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    return float(best_ema)
-
-
-# =============================================================
-# 单次训练（固定超参 + 单 seed）：
-# - fixed budget (TOTAL_EPOCHS)，但允许 EMA-based early stop（PATIENCE_TRAIN）
-# - best selection: val_ema
-# - 同时保存 last & best
-# =============================================================
-# =============================================================
-# val EMA helpers (ALIGN with FiLM version: alpha form)
-# =============================================================
-def ema_update_alpha(prev: Optional[float], x: float, alpha: float) -> float:
-    """
-    Align with FiLM version:
-      if prev is None: prev = x
-      else: prev = alpha * x + (1 - alpha) * prev
-    where alpha is typically 0.2~0.4 (default 0.30).
-    """
-    if prev is None or (isinstance(prev, float) and (not math.isfinite(prev))):
-        return float(x)
-    a = float(alpha)
-    return a * float(x) + (1.0 - a) * float(prev)
-
-
-# =============================================================
-# Optuna objective（search 阶段固定 SEARCH_SEED）
-# - best selection: val_ema
-# - early stop: val_ema
-#   (keep early stop here; ONLY remove early stop in train_one_seed)
-# =============================================================
-def objective(trial: optuna.trial.Trial) -> float:
-    # ✅ search 阶段固定住一切随机性（只让 trial 的 params 变化）
-    set_seed(SEARCH_SEED)
-
-    g_trial = torch.Generator()
-    g_trial.manual_seed(SEARCH_SEED)
-
-    model = create_cnn3d_from_trial(trial, input_dim, nx, ny, nz)
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-
-    lr_max = float(trial.suggest_float("lr", 1e-5, 1e-2, log=True))
-    optimizer = optim.Adam(model.parameters(), lr=lr_max)
-
-    train_loader = DataLoader(
-        TensorDataset(x_train_t, y_train_t, m_train_t),
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        generator=g_trial,
-        pin_memory=PIN_MEMORY,
-    )
-    val_loader = DataLoader(
-        TensorDataset(x_val_t, y_val_t, m_val_t),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        pin_memory=PIN_MEMORY,
-    )
-
-    # objective 训练预算（保持你原来的 80）
+    # -------- LR schedule for search --------
     total_epochs = 80
-    warmup_epochs = min(10, total_epochs // 4)
+    warmup_epochs = min(int(WARMUP_EPOCHS), 10)
     lr_init = lr_max * 0.1
     eta_min = lr_max * 1e-2
     hold_epochs = 0
 
-    # -------- EMA selection + EMA early stop (ALIGN with FiLM version) --------
-    alpha = float(os.environ.get("VAL_EMA_ALPHA", "0.30"))  # 0.2~0.4 常用
-    min_delta = 1e-6  # same as FiLM snippet
-    # patience for search uses your PATIENCE_SEARCH (or you can hardcode 30 like FiLM)
-    patience = int(PATIENCE_SEARCH)
-
-    best_ema = float("inf")
-    best_epoch = -1
-    val_ema: Optional[float] = None
-    no_improve = 0
-
-    # init lr to warmup start
     set_optimizer_lr(optimizer, lr_init)
 
     for epoch in range(total_epochs):
-        # --- train ---
+        # ---- train ----
         model.train()
         for xb, yb, mb in train_loader:
             xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
@@ -657,7 +496,7 @@ def objective(trial: optuna.trial.Trial) -> float:
             loss.backward()
             optimizer.step()
 
-        # --- lr step ---
+        # ---- lr step (warmup->cosine->eta_min) ----
         lr = lr_warmup_cosine_eta_min(
             epoch=epoch,
             total_epochs=total_epochs,
@@ -669,25 +508,27 @@ def objective(trial: optuna.trial.Trial) -> float:
         )
         set_optimizer_lr(optimizer, lr)
 
-        # --- val ---
+        # ---- val ----
         model.eval()
-        vtot = 0.0
+        val_loss_total = 0.0
         with torch.no_grad():
             for xb, yb, mb in val_loader:
                 xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
                 pred = model(xb)
                 vloss = masked_loss(pred, yb, mb)
-                vtot += vloss.item() * xb.size(0)
+                val_loss_total += vloss.item() * xb.size(0)
 
-        val_loss = float(vtot / len(val_loader.dataset))
+        val_loss = val_loss_total / len(val_loader.dataset)
 
-        # --- EMA update (alpha-form) ---
-        val_ema = ema_update_alpha(val_ema, val_loss, alpha=alpha)
+        # ---- EMA update (FiLM-style) ----
+        if val_ema is None:
+            val_ema = float(val_loss)
+        else:
+            val_ema = alpha * float(val_loss) + (1.0 - alpha) * float(val_ema)
 
-        # --- best/early stop based on EMA ---
+        # ---- best selection + early stop based on EMA ----
         if val_ema < best_ema - min_delta:
             best_ema = float(val_ema)
-            best_epoch = int(epoch)
             no_improve = 0
         else:
             no_improve += 1
@@ -703,8 +544,8 @@ def objective(trial: optuna.trial.Trial) -> float:
 
 # =============================================================
 # 单次训练（固定超参 + 单 seed）：
-# - fixed budget (TOTAL_EPOCHS)  ✅ NO early stopping (ALIGN with FiLM version)
-# - best selection: val_ema
+# - fixed budget (TOTAL_EPOCHS) —— 不 early stop（与 FiLM 版本一致）
+# - best selection: val_ema（FiLM-style EMA update）
 # - 同时保存 last & best
 # =============================================================
 def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
@@ -719,7 +560,6 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
 
     optimizer = optim.Adam(model.parameters(), lr=lr_max)
 
-    # dataloaders (shuffle depends on seed)
     g_train = torch.Generator()
     g_train.manual_seed(seed)
 
@@ -730,6 +570,7 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
         generator=g_train,
         pin_memory=PIN_MEMORY,
     )
+
     val_loader = DataLoader(
         TensorDataset(x_val_t, y_val_t, m_val_t),
         batch_size=BATCH_SIZE,
@@ -746,26 +587,24 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
 
     set_optimizer_lr(optimizer, lr_init)
 
-    # ---- EMA selection params (ALIGN with FiLM version) ----
+    # ---- EMA selection params (FiLM-style) ----
     alpha = float(os.environ.get("VAL_EMA_ALPHA", "0.30"))
-    min_delta = 1e-6
+    min_delta = float(os.environ.get("MIN_DELTA", "1e-6"))
 
-    # best checkpoint tracking (based on val_ema)
     best_ema = float("inf")
     best_epoch = -1
     best_state = None
 
-    val_ema: Optional[float] = None
+    val_ema = None
 
     model_core = model.module if isinstance(model, nn.DataParallel) else model
 
     last_epoch = -1
     last_val = float("nan")
     last_val_ema = float("nan")
-    last_state = None  # optional: keep last checkpoint weights too
 
-    print(f"\n===== Train seed={seed} | fixed-budget={total_epochs} | warmup={warmup_epochs} | alpha={alpha} =====")
-    print(f"[seed={seed}] lr_max={lr_max:.3e} | eta_min={eta_min:.3e} | lr_init={lr_init:.3e} | hold_epochs={hold_epochs}")
+    print(f"\n===== Train seed={seed} | fixed-budget={total_epochs} =====")
+    print(f"[seed={seed}] lr_max={lr_max:.3e} | eta_min={eta_min:.3e} | lr_init={lr_init:.3e} | hold_epochs={hold_epochs} | alpha={alpha}")
 
     for epoch in range(total_epochs):
         last_epoch = int(epoch)
@@ -784,7 +623,7 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
 
         train_loss = float(running / len(train_loader.dataset))
 
-        # ---- lr: warmup -> cosine to eta_min -> (optional) hold ----
+        # ---- lr: warmup -> cosine -> eta_min (optional hold) ----
         lr = lr_warmup_cosine_eta_min(
             epoch=epoch,
             total_epochs=total_epochs,
@@ -808,16 +647,16 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
 
         val_loss = float(vtot / len(val_loader.dataset))
 
-        # ---- EMA update (alpha-form) ----
-        val_ema = ema_update_alpha(val_ema, val_loss, alpha=alpha)
+        # ---- EMA update (FiLM-style) ----
+        if val_ema is None:
+            val_ema = float(val_loss)
+        else:
+            val_ema = alpha * float(val_loss) + (1.0 - alpha) * float(val_ema)
 
         last_val = float(val_loss)
         last_val_ema = float(val_ema)
 
-        # (optional) capture last checkpoint weights
-        last_state = {k: v.detach().cpu().clone() for k, v in model_core.state_dict().items()}
-
-        # ---- best selection based on val_ema (NO EARLY STOP) ----
+        # ---- best selection based on EMA ----
         if val_ema < best_ema - min_delta:
             best_ema = float(val_ema)
             best_epoch = int(epoch)
@@ -839,7 +678,9 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
         {
             "state_dict": model_core.state_dict(),
             "input_dim": input_dim,
-            "nx": nx, "ny": ny, "nz": nz,
+            "nx": nx,
+            "ny": ny,
+            "nz": nz,
             "depth": 3,
             "base_ch": 24,
             "dropout_p": float(dropout_p),
@@ -848,8 +689,7 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
             "eta_min": float(eta_min),
             "warmup_epochs": int(warmup_epochs),
             "total_epochs_budget": int(total_epochs),
-            "early_stop_patience": int(PATIENCE_TRAIN),
-            "val_ema_decay": float(VAL_EMA_DECAY),
+            "val_ema_alpha": float(alpha),
             "x_mean": scaler_x.mean_,
             "x_scale": scaler_x.scale_,
             "Y_means": Y_means,
@@ -864,7 +704,7 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
             "last_val": float(last_val),
             "last_val_ema": float(last_val_ema),
             "best_epoch": int(best_epoch),
-            "best_val_ema": float(best_ema),
+            "best_ema": float(best_ema),
         },
         last_ckpt_path,
     )
@@ -877,7 +717,9 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
         {
             "state_dict": model_core.state_dict(),
             "input_dim": input_dim,
-            "nx": nx, "ny": ny, "nz": nz,
+            "nx": nx,
+            "ny": ny,
+            "nz": nz,
             "depth": 3,
             "base_ch": 24,
             "dropout_p": float(dropout_p),
@@ -886,8 +728,7 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
             "eta_min": float(eta_min),
             "warmup_epochs": int(warmup_epochs),
             "total_epochs_budget": int(total_epochs),
-            "early_stop_patience": int(PATIENCE_TRAIN),
-            "val_ema_decay": float(VAL_EMA_DECAY),
+            "val_ema_alpha": float(alpha),
             "x_mean": scaler_x.mean_,
             "x_scale": scaler_x.scale_,
             "Y_means": Y_means,
@@ -899,7 +740,7 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
             "train_seed": int(seed),
             "ckpt_kind": "best",
             "best_epoch": int(best_epoch),
-            "best_val_ema": float(best_ema),
+            "best_ema": float(best_ema),
             "last_epoch": int(last_epoch),
             "last_val": float(last_val),
             "last_val_ema": float(last_val_ema),
@@ -908,11 +749,10 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
     )
     print(f"[seed={seed}] Saved BEST ckpt: {best_ckpt_path}")
     print(
-        f"[seed={seed}] best_epoch={best_epoch} | best_val_ema={best_ema:.6f} | "
+        f"[seed={seed}] best_epoch={best_epoch} | best_ema={best_ema:.6f} | "
         f"last_epoch={last_epoch} | last_val={last_val:.6f} | last_val_ema={last_val_ema:.6f}"
     )
 
-    # cleanup
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -920,7 +760,7 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
     return {
         "seed": int(seed),
         "best_epoch": int(best_epoch),
-        "best_val_ema": float(best_ema),
+        "best_ema": float(best_ema),
         "last_epoch": int(last_epoch),
         "last_val": float(last_val),
         "last_val_ema": float(last_val_ema),
@@ -931,8 +771,7 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
         "dropout_p": float(dropout_p),
         "total_epochs_budget": int(total_epochs),
         "warmup_epochs": int(warmup_epochs),
-        "patience_train": int(PATIENCE_TRAIN),
-        "ema_decay": float(VAL_EMA_DECAY),
+        "val_ema_alpha": float(alpha),
     }
 
 
@@ -940,39 +779,43 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
 # 主流程：search or train-only + multi-seed training + summary
 # =============================================================
 print("\n=============================================================")
-print(f"RUN_MODE={RUN_MODE} | BEST_PARAMS_PATH={BEST_PARAMS_PATH}")
+print(f"RUN_MODE={RUN_MODE} | TRAIN_AFTER_SEARCH={TRAIN_AFTER_SEARCH} | BEST_PARAMS_PATH={BEST_PARAMS_PATH}")
 print(f"SEARCH_SEED={SEARCH_SEED} | SEEDS={SEEDS}")
 print(f"N_TRIALS={N_TRIALS} | TOTAL_EPOCHS={TOTAL_EPOCHS} | WARMUP_EPOCHS={WARMUP_EPOCHS} | BATCH_SIZE={BATCH_SIZE}")
-print(f"VAL_EMA_DECAY={VAL_EMA_DECAY} | MIN_DELTA={MIN_DELTA} | PATIENCE_SEARCH={PATIENCE_SEARCH} | PATIENCE_TRAIN={PATIENCE_TRAIN}")
-print(f"LR_MIN_HOLD_EPOCHS={LR_MIN_HOLD_EPOCHS} | MIN_EPOCHS_BEFORE_STOP={MIN_EPOCHS_BEFORE_STOP}")
+print(f"VAL_EMA_ALPHA={VAL_EMA_ALPHA} | MIN_DELTA={MIN_DELTA} | PATIENCE_SEARCH={PATIENCE_SEARCH}")
+print(f"LR_MIN_HOLD_EPOCHS={LR_MIN_HOLD_EPOCHS}")
 print(f"CKPT_PREFIX={CKPT_PREFIX} | SUMMARY_CSV={SUMMARY_CSV_PATH}")
 print("=============================================================\n")
 
 if RUN_MODE not in ("search", "train"):
     raise ValueError('RUN_MODE must be "search" or "train"')
 
+best_params: Dict[str, Any]
+
 if RUN_MODE == "search":
     set_seed(SEARCH_SEED)
-    print("开始 Optuna 超参搜索（结构 + lr；目标=best_val_ema）...")
+    print("开始 Optuna 超参搜索（dropout + lr；目标=best_ema）...")
 
     sampler = optuna.samplers.TPESampler(seed=SEARCH_SEED)
     study = optuna.create_study(direction="minimize", sampler=sampler)
     study.optimize(objective, n_trials=N_TRIALS)
 
     best_params = dict(study.best_params)
-
     print("最佳参数:", best_params)
+
     save_best_params(best_params, BEST_PARAMS_PATH)
     print("best_params saved to:", BEST_PARAMS_PATH)
+
+    if not TRAIN_AFTER_SEARCH:
+        print("TRAIN_AFTER_SEARCH=0 -> 只搜索不训练，退出。")
+        raise SystemExit(0)
 else:
     best_params = load_best_params(BEST_PARAMS_PATH)
     print("Loaded best_params:", best_params)
 
-# ✅ 多 seed 训练 + 汇总
 results = []
 for s in SEEDS:
-    r = train_one_seed(best_params, seed=int(s))
-    results.append(r)
+    results.append(train_one_seed(best_params, seed=int(s)))
 
 df_sum = pd.DataFrame(results)
 df_sum.to_csv(SUMMARY_CSV_PATH, index=False, encoding="utf-8")
@@ -981,23 +824,24 @@ print("\n===== Seed summary =====")
 print(df_sum)
 print(f"Saved summary CSV: {SUMMARY_CSV_PATH}")
 
+
 # =============================================================
 # 命令行用法（示例）
 # =============================================================
-# 1) 先跑一次 Optuna 搜索 + 自动保存 best_params_cnn_concat.json，然后默认 SEED=43 训练
+# 1) 搜索 + 训练一个 seed（默认 SEED=43）
 # RUN_MODE=search N_TRIALS=20 SEARCH_SEED=42 SEED=43 python CNN.py
 #
-# 2) 只训练（train-only），不做任何超参搜索：读取 best_params_cnn_concat.json
+# 2) 只训练（train-only）
 # RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEED=43 python CNN.py
 #
-# 3) 同一份超参，跑一组 seeds，并输出 seed_summary_cnn_concat.csv（推荐做鲁棒性）
+# 3) 同一份超参跑一组 seeds
 # RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEEDS="42,43,44,45,46" python CNN.py
 #
-# 4) 你想固定训练预算/批量大小（只影响训练，不影响 search）
+# 4) 固定预算 / warmup / batch（只影响训练，不影响 search）
 # RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEEDS="42,43,44" TOTAL_EPOCHS=300 WARMUP_EPOCHS=20 BATCH_SIZE=16 python CNN.py
 #
 # 5) 自定义 ckpt 前缀与汇总表路径
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEEDS="42,43" CKPT_PREFIX="ckpt/CNN_Concat" SUMMARY_CSV="ckpt/seed_summary_cnn_concat.csv" python CNN.py
-
-# 6)（如果你加了 TRAIN_AFTER_SEARCH 开关）只搜索不训练
-# RUN_MODE=search TRAIN_AFTER_SEARCH=0 SEARCH_SEED=42 N_TRIALS=20 BEST_PARAMS_PATH=best_params_cnn_concat.json python CNN_FiLM_sdf+bm_GN_RemoveStem.py
+# RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEEDS="42,43" CKPT_PREFIX="ckpt/CNN_Concat" SUMMARY_CSV="ckpt/seed_summary.csv" python CNN.py
+#
+# 6) 只搜索不训练
+# RUN_MODE=search TRAIN_AFTER_SEARCH=0 SEARCH_SEED=42 N_TRIALS=20 BEST_PARAMS_PATH=best_params_cnn_concat.json python CNN.py
