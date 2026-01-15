@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================
-# CNN.py —— 边界条件 → 3D 温度场（Concat BC as voxel channels）
+# CNN_Concat_sdf+bm_GN_RemoveStem.py —— 边界条件 → 3D 温度场（Concat BC as voxel channels）
 #
 # 改造点（同 FiLM 版本口径）：
 # 1) best selection: 用 val_ema（验证损失 EMA），EMA 形式：val_ema = alpha*val + (1-alpha)*val_ema
@@ -774,7 +774,6 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
         "val_ema_alpha": float(alpha),
     }
 
-
 # =============================================================
 # 主流程：search or train-only + multi-seed training + summary
 # =============================================================
@@ -829,19 +828,19 @@ print(f"Saved summary CSV: {SUMMARY_CSV_PATH}")
 # 命令行用法（示例）
 # =============================================================
 # 1) 搜索 + 训练一个 seed（默认 SEED=43）
-# RUN_MODE=search N_TRIALS=20 SEARCH_SEED=42 SEED=43 python CNN.py
+# RUN_MODE=search N_TRIALS=20 SEARCH_SEED=42 SEED=43 python CNN_Concat_sdf+bm_GN_RemoveStem.py
 #
 # 2) 只训练（train-only）
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEED=43 python CNN.py
+# RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEED=43 python CNN_Concat_sdf+bm_GN_RemoveStem.py
 #
 # 3) 同一份超参跑一组 seeds
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEEDS="42,43,44,45,46" python CNN.py
+# RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEEDS="42,43,44,45,46" python CNN_Concat_sdf+bm_GN_RemoveStem.py
 #
 # 4) 固定预算 / warmup / batch（只影响训练，不影响 search）
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEEDS="42,43,44" TOTAL_EPOCHS=300 WARMUP_EPOCHS=20 BATCH_SIZE=16 python CNN.py
+# RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEEDS="42,43,44" TOTAL_EPOCHS=300 WARMUP_EPOCHS=20 BATCH_SIZE=16 python CNN_Concat_sdf+bm_GN_RemoveStem.py
 #
 # 5) 自定义 ckpt 前缀与汇总表路径
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEEDS="42,43" CKPT_PREFIX="ckpt/CNN_Concat" SUMMARY_CSV="ckpt/seed_summary.csv" python CNN.py
+# RUN_MODE=train BEST_PARAMS_PATH=best_params_cnn_concat.json SEEDS="42,43" CKPT_PREFIX="ckpt/CNN_Concat" SUMMARY_CSV="ckpt/seed_summary.csv" python CNN_Concat_sdf+bm_GN_RemoveStem.py
 #
 # 6) 只搜索不训练
-# RUN_MODE=search TRAIN_AFTER_SEARCH=0 SEARCH_SEED=42 N_TRIALS=20 BEST_PARAMS_PATH=best_params_cnn_concat.json python CNN.py
+# RUN_MODE=search TRAIN_AFTER_SEARCH=0 SEARCH_SEED=42 N_TRIALS=20 BEST_PARAMS_PATH=best_params_cnn_concat.json python CNN_Concat_sdf+bm_GN_RemoveStem.py
