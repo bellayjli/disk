@@ -82,7 +82,7 @@ class FiLMResidualBlock(nn.Module):
         return out + residual
 
 def build_model_from_ckpt(ckpt: dict) -> nn.Module:
-    """从 CNN_FiLM_sdf+bm_GN_RemoveStem_seed44_last.pth 重建最新版 FiLM-A(voxel7) 网络结构。"""
+    """从 CNN_FiLM_sdf+bm_GN_RemoveStem_seed47_last.pth 重建最新版 FiLM-A(voxel7) 网络结构。"""
 
     model_type = str(ckpt.get("model_type", ""))
     allowed_prefixes = {
@@ -474,7 +474,7 @@ def save_prediction_artifacts(
 # 主流程：加载 ckpt → 读取 voxel/temp/bc → 构建 test set → 推理评估
 # =============================================================
 
-CKPT_PATH = "CNN_FiLM_sdf+bm_GN_RemoveStem_seed44_last.pth"
+CKPT_PATH = "CNN_FiLM_sdf+bm_GN_RemoveStem_seed47_last.pth"
 datapath_bc = "data/boundary_condition.csv"
 datapath_temp = "data/Temp_all.csv"
 datapath_voxel = "data/cnn_input_channels_no_normals.csv"

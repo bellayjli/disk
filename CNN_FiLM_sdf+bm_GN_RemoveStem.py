@@ -1,5 +1,5 @@
 # =============================================================
-# CNN_FiLM_sdf&bm_7.py  ——  边界条件 → 3D 温度场
+# CNN_FiLM_sdf+bm_GN_RemoveStem.py  ——  边界条件 → 3D 温度场
 # 3D UNet (depth=3) + Optuna + Mask + 小批量训练（避免 OOM）
 #
 # 【两段式改版要点 + 可复现实验】
@@ -750,4 +750,4 @@ def main():
 if __name__ == "__main__":
     main()
 # CUDA_VISIBLE_DEVICES=1,4,6 python CNN_FiLM_sdf+bm_GN_RemoveStem.py --run_mode search --n_trials 20 --params_json best_params_CNN_FiLM_sdf+bm_GN_RemoveStem.json
-# CUDA_VISIBLE_DEVICES=2,4 python CNN_FiLM_sdf+bm_GN_RemoveStem.py --run_mode train --seed 45 --params_json best_params_CNN_FiLM_sdf+bm_GN_RemoveStem.json --out_prefix CNN_FiLM_sdf+bm_GN_RemoveStem
+# CUDA_VISIBLE_DEVICES=2,4 python CNN_FiLM_sdf+bm_GN_RemoveStem.py --run_mode train --seed 47 --params_json best_params_CNN_FiLM_sdf+bm_GN_RemoveStem.json --out_prefix CNN_FiLM_sdf+bm_GN_RemoveStem
