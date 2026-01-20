@@ -2,69 +2,56 @@
 # CNN_FiLM_sdf&bm_7.py  ——  边界条件 → 3D 温度场
 # 3D UNet (depth=3) + Optuna + Mask + 小批量训练（避免 OOM）
 #
-# 修改点（2026-01-15）：
-# 1) trial -> params: create_cnn3d_from_params(params, ...)
-# 2) best_params 落盘 JSON
-# 3) RUN_MODE: search vs train-only
-# 4) 多 seed 只影响训练阶段：search 用 SEARCH_SEED 固定；train 用 SEEDS
-# 5) 同一份超参跑一组 seeds，并输出汇总 seed_summary.csv
+# 【两段式改版要点 + 可复现实验】
+# 1) Optuna 搜索阶段：proxy training，仍用原始 train/val 评估 (objective=val loss)
+#    - 搜索阶段不固定 seed（不把随机性“学成超参”）
+#    - 搜索完成后保存 best_params 到 JSON
+# 2) 最终训练阶段：train+val 合并训练，固定 total_epochs=300
+#    - 训练阶段固定 seed，便于你后续改 seed 批量复现实验
+#    - 保存 last + bestTrain
+#
+# 用法：
+#   - 搜索一次并保存超参：--run_mode search
+#   - 用保存的超参训练：  --run_mode train --seed 43
 # =============================================================
 
-import os
+from __future__ import annotations
+
+import argparse
 import json
 import math
+import os
 import random
-from typing import Dict, Any, List
+from dataclasses import asdict
+from typing import Any, Dict
 
-import optuna
 import numpy as np
+import optuna
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, TensorDataset
+
+# -------------------------------------------------------------
+# Globals (voxel + mask cached on GPU)
+# -------------------------------------------------------------
+GEOM_MASK = None
+VOXEL_INPUT = None
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+if device.type == "cuda":
+    torch.cuda.init()
+    print(f"CUDA devices: {torch.cuda.device_count()} visible.")
 
 
 # =============================================================
-# 运行模式 / 配置（环境变量）
+# Utilities
 # =============================================================
-RUN_MODE = os.environ.get("RUN_MODE", "search").strip().lower()  # "search" or "train"
-TRAIN_AFTER_SEARCH = os.environ.get("TRAIN_AFTER_SEARCH", "1").strip() not in ("0", "false", "no")
-BEST_PARAMS_PATH = os.environ.get("BEST_PARAMS_PATH", "best_params_film.json")
-
-# Search 阶段固定 seed（保证 trial 可比；换训练 seed 不会影响搜索）
-SEARCH_SEED = int(os.environ.get("SEARCH_SEED", "42"))
-
-# 训练阶段 seed 列表（只影响训练）
-# 用法：SEEDS="42,43,44,45,46"
-SEEDS_ENV = os.environ.get("SEEDS", "").strip()
-if SEEDS_ENV:
-    SEEDS: List[int] = [int(s) for s in SEEDS_ENV.split(",") if s.strip() != ""]
-else:
-    # 兼容：如果你只想跑一个 seed，可以用 SEED=43
-    SEEDS = [int(os.environ.get("SEED", "43"))]
-
-# Optuna trials
-N_TRIALS = int(os.environ.get("N_TRIALS", "20"))
-
-# 固定训练预算（你的单阶段 fixed-budget 逻辑）
-TOTAL_EPOCHS = int(os.environ.get("TOTAL_EPOCHS", "500"))
-WARMUP_EPOCHS = int(os.environ.get("WARMUP_EPOCHS", "20"))
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
-
-# 输出路径
-SUMMARY_CSV_PATH = os.environ.get("SUMMARY_CSV", "seed_summary_film_allBlock.csv")
-
-# ckpt 命名前缀
-CKPT_PREFIX = os.environ.get("CKPT_PREFIX", "best_CNN_FiLM_sdf+bm_GN_RemoveStem")
-
-
-# =============================================================
-# 随机种子工具（训练阶段会反复调用；search 阶段也会固定调用）
-# =============================================================
-def set_seed(seed: int):
+def set_seed(seed: int, *, deterministic: bool = False):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -72,35 +59,10 @@ def set_seed(seed: int):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-
-# =============================================================
-# best_params JSON 落盘/读盘
-# =============================================================
-def save_best_params(best_params: Dict[str, Any], path: str):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(best_params, f, ensure_ascii=False, indent=2, sort_keys=True)
-
-
-def load_best_params(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-# -------------------------------------------------------------
-# 全局监督 Mask（1,1,nx,ny,nz）：来自 C0（inside_mask）
-# 固定 3D 体素输入（1,7,nx,ny,nz）：来自 cnn_input_channels_no_normals.csv
-# -------------------------------------------------------------
-GEOM_MASK = None
-VOXEL_INPUT = None
-
-# --------------------- 设备 ---------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
-
-if device.type == "cuda":
-    torch.cuda.init()
-    print(f"CUDA devices: {torch.cuda.device_count()} visible.")
+    if deterministic:
+        # 这会略慢，但更可复现；你也可以关掉
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def make_gn(C: int, max_groups: int = 8):
@@ -110,8 +72,28 @@ def make_gn(C: int, max_groups: int = 8):
     return nn.GroupNorm(G, C)
 
 
+def masked_loss(pred, target, mask):
+    per_elem = F.smooth_l1_loss(pred, target, reduction="none")
+    masked = per_elem * mask
+    return masked.sum() / (mask.sum() + 1e-8)
+
+
+def set_group_lrs(optimizer, lr_backbone: float, film_lr_mult: float):
+    optimizer.param_groups[0]["lr"] = float(lr_backbone)
+    optimizer.param_groups[1]["lr"] = float(lr_backbone) * float(film_lr_mult)
+
+
+def backbone_cosine_lr(epoch: int, total_epochs: int, warmup_epochs: int, lr_max: float, lr_init: float) -> float:
+    if epoch < warmup_epochs:
+        t = float(epoch + 1) / float(max(1, warmup_epochs))
+        return lr_init + (lr_max - lr_init) * t
+    e = epoch - warmup_epochs
+    T = max(1, total_epochs - warmup_epochs)
+    return lr_max * 0.5 * (1.0 + math.cos(math.pi * (e / T)))
+
+
 # =============================================================
-# FiLM Residual Block（FiLM 放在 GN 后、激活前）
+# Model
 # =============================================================
 class FiLMResidualBlock(nn.Module):
     """(Conv -> GN -> FiLM -> GELU) x2 -> Dropout + residual"""
@@ -143,29 +125,16 @@ class FiLMResidualBlock(nn.Module):
         return out + residual
 
 
-# =============================================================
-# ✅ 1) 模型构建：from params（不依赖 optuna trial）
-# =============================================================
 def create_cnn3d_from_params(params: Dict[str, Any], input_dim: int, nx: int, ny: int, nz: int) -> nn.Module:
-    """
-    depth=3 的 FiLM-UNet(voxel7)：
-    - 体素输入固定 7 通道
-    - bc(6维) 生成各层 gamma/beta
-    """
     depth = 3
     base_ch = 24
 
     dropout_p = float(params.get("dropout_p", 0.1))
-
-    # 固定常数（你原脚本写死的）
-    film_hidden = int(params.get("film_hidden", 96))
-
+    film_hidden = 96
     film_scale = float(params.get("film_scale", 1.0))
     film_mlp_dropout = float(params.get("film_mlp_dropout", 0.0))
 
     class FiLMGen(nn.Module):
-        """bc -> {gamma,beta} for each injection point; each is (B,C,1,1,1)."""
-
         def __init__(self, input_dim: int, ch_list: list[int], hidden: int, scale: float, mlp_dropout: float):
             super().__init__()
             self.ch_list = ch_list
@@ -184,7 +153,7 @@ def create_cnn3d_from_params(params: Dict[str, Any], input_dim: int, nx: int, ny
 
         def forward(self, bc: torch.Tensor):
             B = bc.size(0)
-            v = self.net(bc)  # (B, 2*sumC)
+            v = self.net(bc)
             gammas, betas = [], []
             offset = 0
             s = self.scale
@@ -205,56 +174,36 @@ def create_cnn3d_from_params(params: Dict[str, Any], input_dim: int, nx: int, ny
             self.base_ch = base_ch
             self.film_hidden = film_hidden
             self.film_scale = film_scale
-            self.film_mlp_dropout = film_mlp_dropout
 
-            # 固定输入：7 通道体素输入
             assert VOXEL_INPUT is not None, "VOXEL_INPUT 未初始化"
-            self.register_buffer("voxel_input", VOXEL_INPUT)  # (1,7,nx,ny,nz)
+            self.register_buffer("voxel_input", VOXEL_INPUT)
 
-            # 监督/门控 mask：C0
             assert GEOM_MASK is not None, "GEOM_MASK 未初始化"
-            self.register_buffer("geom_mask", GEOM_MASK)  # (1,1,nx,ny,nz)
+            self.register_buffer("geom_mask", GEOM_MASK)
 
-            # ===== full-res light block + MaxPool =====
             c0 = max(8, base_ch // 2)
 
-            # Full-res "pre-encoder" block: (7 -> c0) at resolution /1
-            self.enc0_full = FiLMResidualBlock(7, c0, dropout_p=dropout_p)  # /1
+            self.enc0_full = FiLMResidualBlock(7, c0, dropout_p=dropout_p)
+            self.pool0 = nn.MaxPool3d(kernel_size=2, stride=2)
 
-            self.pool0 = nn.MaxPool3d(kernel_size=2, stride=2)  # /2
+            self.enc0 = FiLMResidualBlock(c0, base_ch, dropout_p=dropout_p)
+            self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2)
+            self.enc1 = FiLMResidualBlock(base_ch, base_ch * 2, dropout_p=dropout_p)
+            self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)
+            self.enc2 = FiLMResidualBlock(base_ch * 2, base_ch * 4, dropout_p=dropout_p)
 
-            # Encoder (depth=3)
-            self.enc0 = FiLMResidualBlock(c0, base_ch, dropout_p=dropout_p)  # /2
-            self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2)              # /4
-            self.enc1 = FiLMResidualBlock(base_ch, base_ch * 2, dropout_p=dropout_p)  # /4
-            self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)              # /8
-            self.enc2 = FiLMResidualBlock(base_ch * 2, base_ch * 4, dropout_p=dropout_p)  # /8
-
-            # Bottleneck
             bottleneck_ch = base_ch * 4
-            self.bottleneck = FiLMResidualBlock(bottleneck_ch, bottleneck_ch, dropout_p=dropout_p)  # /8
+            self.bottleneck = FiLMResidualBlock(bottleneck_ch, bottleneck_ch, dropout_p=dropout_p)
 
-            # Decoder
-            self.up2_conv = FiLMResidualBlock(bottleneck_ch + base_ch * 2, base_ch * 2, dropout_p=dropout_p)  # /4
-            self.up1_conv = FiLMResidualBlock(base_ch * 2 + base_ch, base_ch, dropout_p=dropout_p)            # /2
+            self.up2_conv = FiLMResidualBlock(bottleneck_ch + base_ch * 2, base_ch * 2, dropout_p=dropout_p)
+            self.up1_conv = FiLMResidualBlock(base_ch * 2 + base_ch, base_ch, dropout_p=dropout_p)
 
             self.out_proj = nn.Conv3d(base_ch, base_ch, kernel_size=1)
 
-            # /2 -> /1
-            self.up0_conv = FiLMResidualBlock(base_ch + c0, c0, dropout_p=dropout_p)  # /1
+            self.up0_conv = FiLMResidualBlock(base_ch + c0, c0, dropout_p=dropout_p)
             self.final_conv = nn.Conv3d(c0, 1, kernel_size=1)
 
-            # ===== FiLM injection channel list (must match forward order) =====
-            ch_list = [
-                c0,           # enc0_full
-                base_ch,      # enc0
-                base_ch * 2,  # enc1
-                base_ch * 4,  # enc2
-                base_ch * 4,  # bottleneck
-                base_ch * 2,  # up2
-                base_ch,      # up1
-                c0,           # up0
-            ]
+            ch_list = [c0, base_ch, base_ch * 2, base_ch * 4, base_ch * 4, base_ch * 2, base_ch, c0]
             self.film = FiLMGen(
                 input_dim=input_dim,
                 ch_list=ch_list,
@@ -262,48 +211,43 @@ def create_cnn3d_from_params(params: Dict[str, Any], input_dim: int, nx: int, ny
                 scale=film_scale,
                 mlp_dropout=film_mlp_dropout,
             )
+            self.film_mlp_dropout = film_mlp_dropout
 
         def forward(self, bc: torch.Tensor) -> torch.Tensor:
             B = bc.size(0)
-            vox = self.voxel_input.expand(B, -1, -1, -1, -1)  # (B,7,nx,ny,nz)
-            mask = self.geom_mask.expand(B, -1, -1, -1, -1)   # (B,1,nx,ny,nz)
+            vox = self.voxel_input.expand(B, -1, -1, -1, -1)
+            mask = self.geom_mask.expand(B, -1, -1, -1, -1)
 
             gammas, betas = self.film(bc)
             gi = 0
 
-            # /1
             x_full_skip = self.enc0_full(vox, gammas[gi], betas[gi]); gi += 1
-
-            # /2
             x = self.pool0(x_full_skip)
 
-            # /2
             x0 = self.enc0(x, gammas[gi], betas[gi]); gi += 1
-            # /4
             x1 = self.pool1(x0)
             x1 = self.enc1(x1, gammas[gi], betas[gi]); gi += 1
-            # /8
             x2 = self.pool2(x1)
             x2 = self.enc2(x2, gammas[gi], betas[gi]); gi += 1
 
-            # /8
             xb = self.bottleneck(x2, gammas[gi], betas[gi]); gi += 1
 
-            # /4
             x_up2 = F.interpolate(xb, size=x1.shape[2:], mode="trilinear", align_corners=False)
-            x_dec2 = self.up2_conv(torch.cat([x_up2, x1], dim=1), gammas[gi], betas[gi]); gi += 1
+            x_cat2 = torch.cat([x_up2, x1], dim=1)
+            x_dec2 = self.up2_conv(x_cat2, gammas[gi], betas[gi]); gi += 1
 
-            # /2
             x_up1 = F.interpolate(x_dec2, size=x0.shape[2:], mode="trilinear", align_corners=False)
-            x_dec1 = self.up1_conv(torch.cat([x_up1, x0], dim=1), gammas[gi], betas[gi]); gi += 1
+            x_cat1 = torch.cat([x_up1, x0], dim=1)
+            x_dec1 = self.up1_conv(x_cat1, gammas[gi], betas[gi]); gi += 1
 
             x_dec = self.out_proj(x_dec1)
 
-            # /1
             x_up0 = F.interpolate(x_dec, size=x_full_skip.shape[2:], mode="trilinear", align_corners=False)
-            x0_full = self.up0_conv(torch.cat([x_up0, x_full_skip], dim=1), gammas[gi], betas[gi]); gi += 1
+            x_cat0 = torch.cat([x_up0, x_full_skip], dim=1)
+            x0_full = self.up0_conv(x_cat0, gammas[gi], betas[gi]); gi += 1
 
-            x_full = self.final_conv(x0_full)  # (B,1,nx,ny,nz)
+            x_full = self.final_conv(x0_full)
+
             out = x_full.squeeze(1)
             out = out * mask.squeeze(1)
             return out
@@ -312,329 +256,344 @@ def create_cnn3d_from_params(params: Dict[str, Any], input_dim: int, nx: int, ny
 
 
 # =============================================================
-# 保留 trial 版本（search 用），但内部只负责采样 -> params -> from_params
+# Data
 # =============================================================
-def create_cnn3d_from_trial(trial: optuna.trial.Trial, input_dim: int, nx: int, ny: int, nz: int) -> nn.Module:
-    params = {
-        "dropout_p": trial.suggest_float("dropout_p", 0.0, 0.3),
-        "film_scale": trial.suggest_float("film_scale", 0.1, 2.0, log=True),
-        "film_mlp_dropout": trial.suggest_float("film_mlp_dropout", 0.0, 0.1),
-        # film_hidden 你原来固定 96，这里也固定；如果未来想搜，再改成 suggest_int
-        "film_hidden": 96,
-    }
-    return create_cnn3d_from_params(params, input_dim, nx, ny, nz)
+def load_data():
+    global GEOM_MASK, VOXEL_INPUT
 
+    datapath_bc = "data/boundary_condition.csv"
+    datapath_temp = "data/Temp_all.csv"
+    datapath_voxel = "data/cnn_input_channels_no_normals.csv"
 
-# =============================================================
-# 数据读取：体素输入 + 温度标签（全网格） + mask
-# =============================================================
-datapath_bc = "data/boundary_condition.csv"
-datapath_temp = "data/Temp_all.csv"
-datapath_voxel = "data/cnn_input_channels_no_normals.csv"
+    df_vox = pd.read_csv(datapath_voxel)
+    required_cols = ["x", "y", "z", "C0", "C1", "C2", "C3", "C4", "C5", "sdf"]
+    missing = [c for c in required_cols if c not in df_vox.columns]
+    if missing:
+        raise KeyError(f"cnn_input_channels_no_normals.csv 缺少列: {missing}")
 
-df_vox = pd.read_csv(datapath_voxel)
+    xv = df_vox["x"].to_numpy(dtype=np.float32)
+    yv = df_vox["y"].to_numpy(dtype=np.float32)
+    zv = df_vox["z"].to_numpy(dtype=np.float32)
 
-required_cols = ["x", "y", "z", "C0", "C1", "C2", "C3", "C4", "C5", "sdf"]
-missing = [c for c in required_cols if c not in df_vox.columns]
-if missing:
-    raise KeyError(f"cnn_input_channels_no_normals.csv 缺少列: {missing}")
+    x_unique = np.sort(np.unique(xv))
+    y_unique = np.sort(np.unique(yv))
+    z_unique = np.sort(np.unique(zv))
+    (nx, ny, nz) = (len(x_unique), len(y_unique), len(z_unique))
+    print(f"体素输入网格尺寸: nx={nx}, ny={ny}, nz={nz}")
 
-xv = df_vox["x"].to_numpy(dtype=np.float32)
-yv = df_vox["y"].to_numpy(dtype=np.float32)
-zv = df_vox["z"].to_numpy(dtype=np.float32)
+    x_index = {float(v): i for i, v in enumerate(x_unique)}
+    y_index = {float(v): i for i, v in enumerate(y_unique)}
+    z_index = {float(v): i for i, v in enumerate(z_unique)}
 
-x_unique = np.sort(np.unique(xv))
-y_unique = np.sort(np.unique(yv))
-z_unique = np.sort(np.unique(zv))
-(nx, ny, nz) = (len(x_unique), len(y_unique), len(z_unique))
-print(f"体素输入网格尺寸: nx={nx}, ny={ny}, nz={nz}")
+    voxel_grid = np.zeros((7, nx, ny, nz), dtype=np.float32)
+    col_order = ["C0", "C1", "C2", "C3", "C4", "C5", "sdf"]
+    cols_np = [df_vox[c].to_numpy(dtype=np.float32) for c in col_order]
 
-x_index = {float(v): i for i, v in enumerate(x_unique)}
-y_index = {float(v): i for i, v in enumerate(y_unique)}
-z_index = {float(v): i for i, v in enumerate(z_unique)}
+    for i in range(df_vox.shape[0]):
+        ix = x_index[float(xv[i])]
+        iy = y_index[float(yv[i])]
+        iz = z_index[float(zv[i])]
+        voxel_grid[:, ix, iy, iz] = np.array([c[i] for c in cols_np], dtype=np.float32)
 
-voxel_grid = np.zeros((7, nx, ny, nz), dtype=np.float32)
-col_order = ["C0", "C1", "C2", "C3", "C4", "C5", "sdf"]
-cols_np = [df_vox[c].to_numpy(dtype=np.float32) for c in col_order]
+    geom_mask_np = (voxel_grid[0] > 0.5).astype(np.float32)
+    GEOM_MASK = torch.tensor(geom_mask_np[None, None, ...], dtype=torch.float32, device=device)
+    VOXEL_INPUT = torch.tensor(voxel_grid[None, ...], dtype=torch.float32, device=device)
+    print(f"全局 C0(inside_mask) 占比: {geom_mask_np.mean() * 100:.3f}%")
 
-for i in range(df_vox.shape[0]):
-    ix = x_index[float(xv[i])]
-    iy = y_index[float(yv[i])]
-    iz = z_index[float(zv[i])]
-    voxel_grid[:, ix, iy, iz] = np.array([c[i] for c in cols_np], dtype=np.float32)
+    # Temp
+    T_np = pd.read_csv(datapath_temp).to_numpy(dtype=np.float32)
+    num_points = int(df_vox.shape[0])
+    if T_np.shape[0] == num_points:
+        Y_raw = T_np.T
+    elif T_np.shape[1] == num_points:
+        Y_raw = T_np
+    else:
+        raise ValueError(f"Temp_all.csv 维度 {T_np.shape} 与点数 num_points={num_points} 不匹配。")
 
-geom_mask_np = (voxel_grid[0] > 0.5).astype(np.float32)
-GEOM_MASK = torch.tensor(geom_mask_np[None, None, ...], dtype=torch.float32, device=device)
-VOXEL_INPUT = torch.tensor(voxel_grid[None, ...], dtype=torch.float32, device=device)
+    num_samples = int(Y_raw.shape[0])
+    print(f"温度样本数: {num_samples}, 点数(全网格): {num_points}")
 
-print(f"全局 C0(inside_mask) 占比: {geom_mask_np.mean() * 100:.3f}%")
+    ix_all = np.array([x_index[float(v)] for v in xv], dtype=np.int64)
+    iy_all = np.array([y_index[float(v)] for v in yv], dtype=np.int64)
+    iz_all = np.array([z_index[float(v)] for v in zv], dtype=np.int64)
+    lin_all = ix_all * (ny * nz) + iy_all * nz + iz_all
 
-# 温度
-T_np = pd.read_csv(datapath_temp).to_numpy(dtype=np.float32)
-num_points = int(df_vox.shape[0])
+    Y_grid = np.zeros((num_samples, nx * ny * nz), dtype=np.float32)
+    Y_grid[:, lin_all] = Y_raw
+    Y_grid = Y_grid.reshape((num_samples, nx, ny, nz))
 
-if T_np.shape[0] == num_points:
-    Y_raw = T_np.T
-elif T_np.shape[1] == num_points:
-    Y_raw = T_np
-else:
-    raise ValueError(f"Temp_all.csv 维度 {T_np.shape} 与点数 num_points={num_points} 不匹配。")
+    mask_valid = np.broadcast_to(geom_mask_np[None, ...], (num_samples, nx, ny, nz)).astype(np.float32)
+    lin_valid = np.where(geom_mask_np.reshape(-1) > 0.5)[0]
+    print(f"真实点占比(由C0给定): {float(mask_valid.mean()) * 100:.3f}%")
 
-num_samples = int(Y_raw.shape[0])
-print(f"温度样本数: {num_samples}, 点数(全网格): {num_points}")
+    # BC + split
+    df_bc = pd.read_csv(datapath_bc)
+    X_data = df_bc.iloc[:, :6].to_numpy(dtype=np.float32)
+    split_raw = df_bc.iloc[:, 6].to_numpy()
 
-ix_all = np.array([x_index[float(v)] for v in xv], dtype=np.int64)
-iy_all = np.array([y_index[float(v)] for v in yv], dtype=np.int64)
-iz_all = np.array([z_index[float(v)] for v in zv], dtype=np.int64)
-lin_all = ix_all * (ny * nz) + iy_all * nz + iz_all
+    if split_raw.dtype.kind in "OUS":
+        split = np.array([str(s).strip().lower() for s in split_raw])
+        train_idx_raw = np.where(split == "train")[0]
+        val_idx_raw = np.where((split == "val") | (split == "valid") | (split == "validation"))[0]
+        test_idx_final = np.where(split == "test")[0]
+    else:
+        train_idx_raw = np.where(split_raw == 0)[0]
+        val_idx_raw = np.where(split_raw == 1)[0]
+        test_idx_final = np.where(split_raw == 2)[0]
 
-Y_grid = np.zeros((num_samples, nx * ny * nz), dtype=np.float32)
-Y_grid[:, lin_all] = Y_raw
-Y_grid = Y_grid.reshape((num_samples, nx, ny, nz))
+    trainval_idx = np.sort(np.concatenate([train_idx_raw, val_idx_raw], axis=0))
+    print(f"原始划分: train={len(train_idx_raw)}, val={len(val_idx_raw)}, test={len(test_idx_final)}")
+    print(f"合并训练集(train+val)={len(trainval_idx)}")
 
-mask_valid = np.broadcast_to(geom_mask_np[None, ...], (num_samples, nx, ny, nz)).astype(np.float32)
-lin_valid = np.where(geom_mask_np.reshape(-1) > 0.5)[0]
-print(f"真实点占比(由C0给定): {float(mask_valid.mean()) * 100:.3f}%")
+    # Scale X
+    scaler_x = StandardScaler()
+    X_scaled = scaler_x.fit_transform(X_data)
 
-# 边界条件与 split
-df_bc = pd.read_csv(datapath_bc)
-X_data = df_bc.iloc[:, :6].to_numpy(dtype=np.float32)
-split_raw = df_bc.iloc[:, 6].to_numpy()
+    # Z-score Y per-sample on valid points
+    Y_scaled = np.zeros_like(Y_grid, dtype=np.float32)
+    Y_means = np.zeros((num_samples,), dtype=np.float32)
+    Y_stds = np.zeros((num_samples,), dtype=np.float32)
+    for i in range(num_samples):
+        valid_i = Y_grid[i].reshape(-1)[lin_valid]
+        m = float(valid_i.mean())
+        s = float(valid_i.std()) + 1e-8
+        Y_means[i] = m
+        Y_stds[i] = s
+        Y_scaled_flat = Y_scaled[i].reshape(-1)
+        Y_scaled_flat[lin_valid] = (valid_i - m) / s
 
-if split_raw.dtype.kind in "OUS":
-    split = np.array([str(s).strip().lower() for s in split_raw])
-    train_idx = np.where(split == "train")[0]
-    val_idx = np.where((split == "val") | (split == "valid") | (split == "validation"))[0]
-    test_idx_final = np.where(split == "test")[0]
-else:
-    train_idx = np.where(split_raw == 0)[0]
-    val_idx = np.where(split_raw == 1)[0]
-    test_idx_final = np.where(split_raw == 2)[0]
+    # Slices
+    x_train_raw = X_scaled[train_idx_raw]
+    y_train_raw = Y_scaled[train_idx_raw]
+    m_train_raw = mask_valid[train_idx_raw]
 
-print(f"训练集数量: {len(train_idx)}, 验证集数量: {len(val_idx)}, 测试集数量: {len(test_idx_final)}")
+    x_val_raw = X_scaled[val_idx_raw]
+    y_val_raw = Y_scaled[val_idx_raw]
+    m_val_raw = mask_valid[val_idx_raw]
 
-# 标准化：X 用 StandardScaler；Y 做样本级 Z-score（仅在 mask==1 点上）
-scaler_x = StandardScaler()
-X_scaled = scaler_x.fit_transform(X_data)
+    x_trainval = X_scaled[trainval_idx]
+    y_trainval = Y_scaled[trainval_idx]
+    m_trainval = mask_valid[trainval_idx]
 
-Y_scaled = np.zeros_like(Y_grid, dtype=np.float32)
-Y_means = np.zeros((num_samples,), dtype=np.float32)
-Y_stds = np.zeros((num_samples,), dtype=np.float32)
+    x_test = X_scaled[test_idx_final]
+    y_test = Y_scaled[test_idx_final]
+    m_test = mask_valid[test_idx_final]
 
-for i in range(num_samples):
-    valid_i = Y_grid[i].reshape(-1)[lin_valid]
-    m = float(valid_i.mean())
-    s = float(valid_i.std()) + 1e-8
-    Y_means[i] = m
-    Y_stds[i] = s
-    Y_scaled_flat = Y_scaled[i].reshape(-1)
-    Y_scaled_flat[lin_valid] = (valid_i - m) / s
+    input_dim = x_trainval.shape[1]
+    print(f"输入维度: {input_dim}")
+    print(f"train_raw={x_train_raw.shape[0]}, val_raw={x_val_raw.shape[0]}, trainval={x_trainval.shape[0]}, test={x_test.shape[0]}")
 
-# 切分
-x_train = X_scaled[train_idx]
-y_train = Y_scaled[train_idx]
-mask_train = mask_valid[train_idx]
-
-x_val = X_scaled[val_idx]
-y_val = Y_scaled[val_idx]
-mask_val = mask_valid[val_idx]
-
-x_test = X_scaled[test_idx_final]
-y_test = Y_scaled[test_idx_final]
-mask_test = mask_valid[test_idx_final]
-
-input_dim = x_train.shape[1]
-print(f"训练样本数: {x_train.shape[0]}, 验证样本数: {x_val.shape[0]}, 测试样本数: {x_test.shape[0]}")
-print(f"输入维度: {input_dim}")
-
-# Build dataset tensors ONCE (CPU)
-x_train_t = torch.from_numpy(x_train).to(torch.float32)
-y_train_t = torch.from_numpy(y_train).to(torch.float32)
-m_train_t = torch.from_numpy(mask_train).to(torch.float32)
-
-x_val_t = torch.from_numpy(x_val).to(torch.float32)
-y_val_t = torch.from_numpy(y_val).to(torch.float32)
-m_val_t = torch.from_numpy(mask_val).to(torch.float32)
-
-x_test_t = torch.from_numpy(x_test).to(torch.float32)
-y_test_t = torch.from_numpy(y_test).to(torch.float32)
-m_test_t = torch.from_numpy(mask_test).to(torch.float32)
-
-PIN_MEMORY = (device.type == "cuda")
-
-
-# =============================================================
-# Masked Loss
-# =============================================================
-def masked_loss(pred, target, mask):
-    per_elem = F.smooth_l1_loss(pred, target, reduction="none")
-    masked = per_elem * mask
-    return masked.sum() / (mask.sum() + 1e-8)
-
-
-# =============================================================
-# Optuna objective（search 阶段固定 SEARCH_SEED）
-# =============================================================
-def objective(trial):
-    # ✅ search 阶段固定住一切随机性（只让 trial 的 params 变化）
-    set_seed(SEARCH_SEED)
-
-    g_trial = torch.Generator()
-    g_trial.manual_seed(SEARCH_SEED)  # 所有 trial 完全相同 shuffle
-
-    model = create_cnn3d_from_trial(trial, input_dim, nx, ny, nz)
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-
-    lr_max = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
-    film_lr_mult = trial.suggest_float("film_lr_mult", 0.05, 1.0, log=True)
-
-    core = model.module if isinstance(model, nn.DataParallel) else model
-    film_params = list(core.film.parameters())
-    film_param_ids = {id(p) for p in film_params}
-    backbone_params = [p for p in core.parameters() if id(p) not in film_param_ids]
-
-    optimizer = optim.Adam(
-        [
-            {"params": backbone_params, "lr": lr_max},
-            {"params": film_params, "lr": lr_max * film_lr_mult},
-        ]
+    # Torch tensors (CPU)
+    t = dict(
+        x_train_raw_t=torch.from_numpy(x_train_raw).float(),
+        y_train_raw_t=torch.from_numpy(y_train_raw).float(),
+        m_train_raw_t=torch.from_numpy(m_train_raw).float(),
+        x_val_raw_t=torch.from_numpy(x_val_raw).float(),
+        y_val_raw_t=torch.from_numpy(y_val_raw).float(),
+        m_val_raw_t=torch.from_numpy(m_val_raw).float(),
+        x_trainval_t=torch.from_numpy(x_trainval).float(),
+        y_trainval_t=torch.from_numpy(y_trainval).float(),
+        m_trainval_t=torch.from_numpy(m_trainval).float(),
+        x_test_t=torch.from_numpy(x_test).float(),
+        y_test_t=torch.from_numpy(y_test).float(),
+        m_test_t=torch.from_numpy(m_test).float(),
     )
 
-    train_loader = DataLoader(
-        TensorDataset(x_train_t, y_train_t, m_train_t),
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        generator=g_trial,
-        pin_memory=PIN_MEMORY,
+    return dict(
+        nx=nx, ny=ny, nz=nz,
+        input_dim=input_dim,
+        scaler_x=scaler_x,
+        Y_means=Y_means,
+        Y_stds=Y_stds,
+        geom_mask_np=geom_mask_np,
+        lin_valid=lin_valid,
+        voxel_cols=col_order,
+        **t,
     )
 
-    val_loader = DataLoader(
-        TensorDataset(x_val_t, y_val_t, m_val_t),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        pin_memory=PIN_MEMORY,
-    )
 
-    # -------- EMA selection + EMA early stop --------
-    alpha = float(os.environ.get("VAL_EMA_ALPHA", "0.30"))  # 0.2~0.4 常用
-    min_delta = 1e-6
-    patience = 30
-    no_improve = 0
+# =============================================================
+# Optuna (proxy training)
+# =============================================================
+PROXY_EPOCHS = 30
+PROXY_MAX_STEPS_PER_EPOCH = 16
+PROXY_PATIENCE = 6
+PROXY_MIN_DELTA = 1e-6
 
-    best_ema = float("inf")
-    val_ema = None
 
-    # -------- LR schedule for search --------
-    # objective 跑 80 epoch：warmup 取 min(WARMUP_EPOCHS, 10) 比较合理
-    total_epochs = 80
-    warmup_epochs = min(int(WARMUP_EPOCHS), 20)
-    lr_init = lr_max * 0.1
+def run_optuna_search(data: Dict[str, Any], *, n_trials: int, params_json_path: str):
+    print("开始 Optuna 超参搜索（proxy training on train_raw, eval on val_raw）...")
 
-    # eta_min = lr_max * 1e-2 (默认) 或 1e-3（可用环境变量调）
-    eta_ratio = float(os.environ.get("ETA_MIN_RATIO", "1e-2"))
-    eta_min = lr_max * eta_ratio
+    nx, ny, nz = data["nx"], data["ny"], data["nz"]
+    input_dim = data["input_dim"]
 
-    # init lr to warmup start
-    set_group_lrs(optimizer, lr_backbone=lr_init, film_lr_mult=film_lr_mult)
+    x_train_raw_t = data["x_train_raw_t"]
+    y_train_raw_t = data["y_train_raw_t"]
+    m_train_raw_t = data["m_train_raw_t"]
+    x_val_raw_t = data["x_val_raw_t"]
+    y_val_raw_t = data["y_val_raw_t"]
+    m_val_raw_t = data["m_val_raw_t"]
 
-    for epoch in range(total_epochs):
-        # ---- train ----
-        model.train()
-        for xb, yb, mb in train_loader:
-            xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            pred = model(xb)
-            loss = masked_loss(pred, yb, mb)
-            loss.backward()
-            optimizer.step()
+    pin_memory = (device.type == "cuda")
 
-        # ---- lr step (warmup->cosine->eta_min) ----
-        lr_backbone = backbone_cosine_lr(
-            epoch=epoch,
-            total_epochs=total_epochs,
-            warmup_epochs=warmup_epochs,
-            lr_max=lr_max,
-            lr_init=lr_init,
-            eta_min=eta_min,
+    def objective(trial: optuna.trial.Trial):
+        # ✅ 搜索阶段“不固定 seed”：不 set_seed，不固定 generator seed
+        # 让不同 trial 的 shuffle/初始化噪声自然存在（你希望的）
+        g_trial = torch.Generator()
+        g_trial.seed()  # random seed from internal entropy
+
+        params = {
+            "dropout_p": trial.suggest_float("dropout_p", 0.0, 0.3),
+            "film_scale": trial.suggest_float("film_scale", 0.1, 2.0, log=True),
+            "film_mlp_dropout": trial.suggest_float("film_mlp_dropout", 0.0, 0.1),
+        }
+
+        # lr params are also searched
+        lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
+        film_lr_mult = trial.suggest_float("film_lr_mult", 0.05, 1.0, log=True)
+        params["lr"] = float(lr)
+        params["film_lr_mult"] = float(film_lr_mult)
+
+        model = create_cnn3d_from_params(params, input_dim, nx, ny, nz)
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
+
+        core = model.module if isinstance(model, nn.DataParallel) else model
+        film_params = list(core.film.parameters())
+        film_param_ids = {id(p) for p in film_params}
+        backbone_params = [p for p in core.parameters() if id(p) not in film_param_ids]
+
+        optimizer = optim.Adam(
+            [
+                {"params": backbone_params, "lr": lr},
+                {"params": film_params, "lr": lr * film_lr_mult},
+            ]
         )
-        set_group_lrs(optimizer, lr_backbone=lr_backbone, film_lr_mult=film_lr_mult)
 
-        # ---- val ----
-        model.eval()
-        val_loss_total = 0.0
-        with torch.no_grad():
-            for xb, yb, mb in val_loader:
+        train_loader = DataLoader(
+            TensorDataset(x_train_raw_t, y_train_raw_t, m_train_raw_t),
+            batch_size=16,
+            shuffle=True,
+            generator=g_trial,
+            pin_memory=pin_memory,
+        )
+        val_loader = DataLoader(
+            TensorDataset(x_val_raw_t, y_val_raw_t, m_val_raw_t),
+            batch_size=16,
+            shuffle=False,
+            pin_memory=pin_memory,
+        )
+
+        best_val = float("inf")
+        no_improve = 0
+
+        for epoch in range(PROXY_EPOCHS):
+            model.train()
+            for step_i, (xb, yb, mb) in enumerate(train_loader):
+                if step_i >= PROXY_MAX_STEPS_PER_EPOCH:
+                    break
                 xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
+                optimizer.zero_grad(set_to_none=True)
                 pred = model(xb)
-                vloss = masked_loss(pred, yb, mb)
-                val_loss_total += vloss.item() * xb.size(0)
-        val_loss = val_loss_total / len(val_loader.dataset)
+                loss = masked_loss(pred, yb, mb)
+                loss.backward()
+                optimizer.step()
 
-        # ---- EMA update ----
-        if val_ema is None:
-            val_ema = float(val_loss)
-        else:
-            val_ema = alpha * float(val_loss) + (1.0 - alpha) * float(val_ema)
+            model.eval()
+            vtot = 0.0
+            with torch.no_grad():
+                for xb, yb, mb in val_loader:
+                    xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
+                    pred = model(xb)
+                    vloss = masked_loss(pred, yb, mb)
+                    vtot += vloss.item() * xb.size(0)
+            val_loss = vtot / len(val_loader.dataset)
 
-        # ---- best selection + early stop based on EMA ----
-        if val_ema < best_ema - min_delta:
-            best_ema = float(val_ema)
-            no_improve = 0
-        else:
-            no_improve += 1
-            if no_improve >= patience:
+            # --- early-stop + pruning (FIXED) ---
+            prev_best = best_val  # keep previous best BEFORE update
+
+            # update best/plateau counters
+            if val_loss < prev_best - PROXY_MIN_DELTA:
+                best_val = val_loss
+                no_improve = 0
+            else:
+                no_improve += 1
+
+            # report a monotonic signal (best so far) for more stable pruning
+            trial.report(best_val, step=epoch)
+            if trial.should_prune():
+                del model
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                raise optuna.TrialPruned()
+
+            # early stop after reporting (so Optuna has the last metric)
+            if no_improve >= PROXY_PATIENCE:
                 break
 
-    del model
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return float(best_val)
 
-    return float(best_ema)
+    # ✅ 搜索阶段不固定 sampler seed
+    sampler = optuna.samplers.TPESampler()
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=8, interval_steps=1)
+
+    study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
+    study.optimize(objective, n_trials=n_trials)
+
+    best_params = study.best_params
+    print("Optuna best_params:", best_params)
+
+    os.makedirs(os.path.dirname(params_json_path) or ".", exist_ok=True)
+    with open(params_json_path, "w", encoding="utf-8") as f:
+        json.dump(best_params, f, indent=2, ensure_ascii=False)
+    print(f"已保存 best_params 到: {params_json_path}")
+
+    return best_params
+
+
+def load_best_params(params_json_path: str) -> Dict[str, Any]:
+    if not os.path.isfile(params_json_path):
+        raise FileNotFoundError(f"找不到 params_json_path: {params_json_path}（请先 run_mode=search 生成它）")
+    with open(params_json_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
 
 # =============================================================
-# 单次训练（固定超参 + 单 seed），并返回汇总信息
+# Final training (fixed seed)
 # =============================================================
-def set_group_lrs(optimizer, lr_backbone: float, film_lr_mult: float):
-    optimizer.param_groups[0]["lr"] = float(lr_backbone)
-    optimizer.param_groups[1]["lr"] = float(lr_backbone) * float(film_lr_mult)
+def train_final(data: Dict[str, Any], best_params: Dict[str, Any], *, seed: int, out_prefix: str):
+    # ✅ 训练阶段固定 seed（你要的鲁棒性评估入口）
+    set_seed(seed, deterministic=False)
 
+    nx, ny, nz = data["nx"], data["ny"], data["nz"]
+    input_dim = data["input_dim"]
 
-def backbone_cosine_lr(
-    epoch: int,
-    total_epochs: int,
-    warmup_epochs: int,
-    lr_max: float,
-    lr_init: float,
-    eta_min: float,
-) -> float:
-    """
-    Backbone LR schedule:
-    - warmup_epochs: linear lr_init -> lr_max
-    - cosine: lr_max -> eta_min   (NOT to 0)
-      lr = eta_min + (lr_max - eta_min) * 0.5 * (1 + cos(pi * t))
-    """
-    if epoch < warmup_epochs:
-        t = float(epoch + 1) / float(max(1, warmup_epochs))
-        return lr_init + (lr_max - lr_init) * t
+    x_trainval_t = data["x_trainval_t"]
+    y_trainval_t = data["y_trainval_t"]
+    m_trainval_t = data["m_trainval_t"]
 
-    e = epoch - warmup_epochs
-    T = max(1, total_epochs - warmup_epochs)
-    t = float(e) / float(T)
-    return float(eta_min) + (float(lr_max) - float(eta_min)) * 0.5 * (1.0 + math.cos(math.pi * t))
+    scaler_x = data["scaler_x"]
+    Y_means = data["Y_means"]
+    Y_stds = data["Y_stds"]
+    geom_mask_np = data["geom_mask_np"]
+    lin_valid = data["lin_valid"]
+    voxel_cols = data["voxel_cols"]
 
-def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
-    # ✅ 训练阶段随机性只来自这个 seed
-    set_seed(seed)
+    params_model = {
+        "dropout_p": float(best_params.get("dropout_p", 0.1)),
+        "film_scale": float(best_params.get("film_scale", 1.0)),
+        "film_mlp_dropout": float(best_params.get("film_mlp_dropout", 0.0)),
+    }
 
-    # model
-    model = create_cnn3d_from_params(best_params, input_dim, nx, ny, nz)
+    model = create_cnn3d_from_params(params_model, input_dim, nx, ny, nz)
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
-    # lr & param groups
-    lr_max = float(best_params.get("lr", 1e-3))
-    film_lr_mult = float(best_params.get("film_lr_mult", 1.0))
+    best_lr = float(best_params.get("lr", 1e-3))
+    best_film_lr_mult = float(best_params.get("film_lr_mult", 1.0))
 
     core = model.module if isinstance(model, nn.DataParallel) else model
     film_params = list(core.film.parameters())
@@ -643,275 +602,152 @@ def train_one_seed(best_params: Dict[str, Any], seed: int) -> Dict[str, Any]:
 
     optimizer = optim.Adam(
         [
-            {"params": backbone_params, "lr": lr_max},
-            {"params": film_params, "lr": lr_max * film_lr_mult},
+            {"params": backbone_params, "lr": best_lr},
+            {"params": film_params, "lr": best_lr * best_film_lr_mult},
         ]
     )
 
-    # dataloaders (shuffle depends on seed)
     g_train = torch.Generator()
     g_train.manual_seed(seed)
 
+    pin_memory = (device.type == "cuda")
     train_loader = DataLoader(
-        TensorDataset(x_train_t, y_train_t, m_train_t),
-        batch_size=BATCH_SIZE,
+        TensorDataset(x_trainval_t, y_trainval_t, m_trainval_t),
+        batch_size=16,
         shuffle=True,
         generator=g_train,
-        pin_memory=PIN_MEMORY,
+        pin_memory=pin_memory,
     )
 
-    val_loader = DataLoader(
-        TensorDataset(x_val_t, y_val_t, m_val_t),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        pin_memory=PIN_MEMORY,
-    )
+    total_epochs = 300
+    warmup_epochs = 20
 
-    # ---- LR schedule params ----
-    lr_init = lr_max * 0.1
-    eta_ratio = float(os.environ.get("ETA_MIN_RATIO", "1e-2"))  # 1e-2 or 1e-3
-    eta_min = lr_max * eta_ratio
-
-    # init lr for warmup start
-    set_group_lrs(optimizer, lr_backbone=lr_init, film_lr_mult=film_lr_mult)
-
-    # ---- EMA selection params ----
-    alpha = float(os.environ.get("VAL_EMA_ALPHA", "0.30"))
-    min_delta = 1e-6
-
-    best_ema = float("inf")
-    best_epoch = -1
-    best_val_at_best = float("inf")  # 记录 best_epoch 对应 raw val_loss（便于读日志）
-    val_ema = None
-    best_state = None
+    initial_lr = best_lr * 0.1
+    set_group_lrs(optimizer, lr_backbone=initial_lr, film_lr_mult=best_film_lr_mult)
 
     model_core = model.module if isinstance(model, nn.DataParallel) else model
 
-    print(f"\n===== Train seed={seed} | fixed-budget={TOTAL_EPOCHS} | eta_min={eta_min:.3e} (ratio={eta_ratio:g}) =====")
+    best_train = float("inf")
+    best_train_epoch = -1
+    best_train_state = None
 
-    last_val = float("nan")
-    last_ema = float("nan")
+    print(f"===== Final train: seed={seed}, fixed 300 epochs on (train+val) =====")
 
-    for epoch in range(TOTAL_EPOCHS):
-        # ---- train ----
+    for epoch in range(total_epochs):
         model.train()
         run = 0.0
         for xb, yb, mb in train_loader:
             xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
-
             optimizer.zero_grad(set_to_none=True)
             pred = model(xb)
             loss = masked_loss(pred, yb, mb)
             loss.backward()
             optimizer.step()
-
             run += loss.item() * xb.size(0)
 
         train_loss = run / len(train_loader.dataset)
 
-        # ---- lr step (warmup->cosine->eta_min) ----
         lr_backbone = backbone_cosine_lr(
             epoch=epoch,
-            total_epochs=TOTAL_EPOCHS,
-            warmup_epochs=WARMUP_EPOCHS,
-            lr_max=lr_max,
-            lr_init=lr_init,
-            eta_min=eta_min,
+            total_epochs=total_epochs,
+            warmup_epochs=warmup_epochs,
+            lr_max=best_lr,
+            lr_init=best_lr * 0.1,
         )
-        set_group_lrs(optimizer, lr_backbone=lr_backbone, film_lr_mult=film_lr_mult)
+        set_group_lrs(optimizer, lr_backbone=lr_backbone, film_lr_mult=best_film_lr_mult)
 
-        # ---- val ----
-        model.eval()
-        vtot = 0.0
-        with torch.no_grad():
-            for xb, yb, mb in val_loader:
-                xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
-                pred = model(xb)
-                vloss = masked_loss(pred, yb, mb)
-                vtot += vloss.item() * xb.size(0)
-        val_loss = vtot / len(val_loader.dataset)
-
-        # ---- EMA update ----
-        if val_ema is None:
-            val_ema = float(val_loss)
-        else:
-            val_ema = alpha * float(val_loss) + (1.0 - alpha) * float(val_ema)
-
-        last_val = float(val_loss)
-        last_ema = float(val_ema)
-
-        # ---- best selection based on EMA ----
-        if val_ema < best_ema - min_delta:
-            best_ema = float(val_ema)
-            best_epoch = int(epoch)
-            best_val_at_best = float(val_loss)
-            best_state = {k: v.detach().cpu().clone() for k, v in model_core.state_dict().items()}
-
-        if epoch % 10 == 0 or epoch == TOTAL_EPOCHS - 1:
+        if epoch % 10 == 0 or epoch == total_epochs - 1:
             print(
-                f"[seed={seed}] Epoch {epoch:03d}, lr_bb={lr_backbone:.3e}, "
-                f"lr_film={(lr_backbone * film_lr_mult):.3e}, "
-                f"train={train_loss:.6f}, val={val_loss:.6f}, val_ema={val_ema:.6f}, "
-                f"best_epoch={best_epoch}, best_ema={best_ema:.6f}"
+                f"[Final] Epoch {epoch:03d}, lr_backbone={lr_backbone:.3e}, "
+                f"lr_film={(lr_backbone * best_film_lr_mult):.3e}, "
+                f"train_loss={train_loss:.6f}, "
+                f"best_train_epoch={best_train_epoch}, best_train={best_train:.6f}"
             )
 
-    if best_state is None:
-        raise RuntimeError("训练结束但 best_state 为空（不应发生）。")
+        if train_loss < best_train - 1e-6:
+            best_train = train_loss
+            best_train_epoch = epoch
+            best_train_state = {k: v.detach().cpu().clone() for k, v in model_core.state_dict().items()}
 
-    # -------------------- Save LAST checkpoint (current weights) --------------------
-    last_ckpt_path = f"{CKPT_PREFIX}_seed{seed}_last.pth"
-    torch.save(
-        {
-            "state_dict": model_core.state_dict(),  # 当前就是 last
-            "input_dim": input_dim,
-            "nx": nx, "ny": ny, "nz": nz,
-            "depth": 3,
-            "base_ch": 24,
-            "dropout_p": float(best_params.get("dropout_p", 0.1)),
-            "model_type": "FiLM_A_voxel7_no_stem_pooldown_fullres_light",
-            "film_hidden": int(best_params.get("film_hidden", 96)),
-            "film_scale": float(best_params.get("film_scale", 1.0)),
-            "film_mlp_dropout": float(best_params.get("film_mlp_dropout", 0.0)),
-            "film_lr_mult": float(best_params.get("film_lr_mult", 1.0)),
-            "lr": float(best_params.get("lr", 1e-3)),
-            "eta_min_ratio": float(eta_ratio),
-            "eta_min": float(eta_min),
-            "val_ema_alpha": float(alpha),
-            "x_mean": scaler_x.mean_,
-            "x_scale": scaler_x.scale_,
-            "Y_means": Y_means,
-            "Y_stds": Y_stds,
-            "geom_mask_np": geom_mask_np,
-            "lin_valid": lin_valid,
-            "voxel_cols": col_order,
-            "train_seed": int(seed),
-            "ckpt_kind": "last",
-            "last_epoch": int(TOTAL_EPOCHS - 1),
-            "last_val": float(last_val),
-            "last_val_ema": float(last_ema),
-            "best_epoch_ema": int(best_epoch),
-            "best_val_ema": float(best_ema),
-            "best_val_at_best_epoch": float(best_val_at_best),
-        },
-        last_ckpt_path,
-    )
-    print(f"[seed={seed}] Saved LAST  ckpt: {last_ckpt_path}")
+    print(f"[Final] Finished. best_train_epoch={best_train_epoch}, best_train={best_train:.6f}")
 
-    # -------------------- Save BEST checkpoint (EMA-best) --------------------
-    model_core.load_state_dict(best_state, strict=True)
-
-    best_ckpt_path = f"{CKPT_PREFIX}_seed{seed}_best.pth"
-    torch.save(
-        {
-            "state_dict": model_core.state_dict(),
-            "input_dim": input_dim,
-            "nx": nx, "ny": ny, "nz": nz,
-            "depth": 3,
-            "base_ch": 24,
-            "dropout_p": float(best_params.get("dropout_p", 0.1)),
-            "model_type": "FiLM_A_voxel7_no_stem_pooldown_fullres_light",
-            "film_hidden": int(best_params.get("film_hidden", 96)),
-            "film_scale": float(best_params.get("film_scale", 1.0)),
-            "film_mlp_dropout": float(best_params.get("film_mlp_dropout", 0.0)),
-            "film_lr_mult": float(best_params.get("film_lr_mult", 1.0)),
-            "lr": float(best_params.get("lr", 1e-3)),
-            "eta_min_ratio": float(eta_ratio),
-            "eta_min": float(eta_min),
-            "val_ema_alpha": float(alpha),
-            "x_mean": scaler_x.mean_,
-            "x_scale": scaler_x.scale_,
-            "Y_means": Y_means,
-            "Y_stds": Y_stds,
-            "geom_mask_np": geom_mask_np,
-            "lin_valid": lin_valid,
-            "voxel_cols": col_order,
-            "train_seed": int(seed),
-            "ckpt_kind": "best_ema",
-            "best_epoch_ema": int(best_epoch),
-            "best_val_ema": float(best_ema),
-            "best_val_at_best_epoch": float(best_val_at_best),
-            "last_epoch": int(TOTAL_EPOCHS - 1),
-            "last_val": float(last_val),
-            "last_val_ema": float(last_ema),
-        },
-        best_ckpt_path,
-    )
-    print(f"[seed={seed}] Saved BEST  ckpt: {best_ckpt_path}")
-    print(f"[seed={seed}] best_epoch(EMA)={best_epoch} | best_ema={best_ema:.6f} | val@best={best_val_at_best:.6f}")
-    print(f"[seed={seed}] last_epoch={TOTAL_EPOCHS - 1} | last_val={last_val:.6f} | last_ema={last_ema:.6f}")
-
-    # cleanup
-    del model
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    return {
+    save_common = {
+        "input_dim": input_dim,
+        "nx": nx,
+        "ny": ny,
+        "nz": nz,
+        "depth": 3,
+        "base_ch": 24,
+        "dropout_p": params_model["dropout_p"],
+        "model_type": "FiLM_A_voxel7_no_stem_pooldown_fullres_light",
+        "film_hidden": int(getattr(model_core, "film_hidden", 96)),
+        "film_scale": params_model["film_scale"],
+        "film_mlp_dropout": params_model["film_mlp_dropout"],
+        "film_lr_mult": float(best_film_lr_mult),
+        "lr": float(best_lr),
+        "x_mean": scaler_x.mean_,
+        "x_scale": scaler_x.scale_,
+        "Y_means": Y_means,
+        "Y_stds": Y_stds,
+        "geom_mask_np": geom_mask_np,
+        "lin_valid": lin_valid,
+        "voxel_cols": voxel_cols,
+        "train_only": True,
+        "total_epochs": total_epochs,
+        "best_train_epoch": int(best_train_epoch),
+        "best_train_loss": float(best_train),
         "seed": int(seed),
-        "best_epoch_ema": int(best_epoch),
-        "best_val_ema": float(best_ema),
-        "best_val_at_best_epoch": float(best_val_at_best),
-        "last_epoch": int(TOTAL_EPOCHS - 1),
-        "last_val": float(last_val),
-        "last_val_ema": float(last_ema),
-        "ckpt_best_path": best_ckpt_path,
-        "ckpt_last_path": last_ckpt_path,
-        "eta_min_ratio": float(eta_ratio),
-        "val_ema_alpha": float(alpha),
+        "best_params": best_params,
+        "optuna_proxy_epochs": int(PROXY_EPOCHS),
+        "optuna_proxy_max_steps_per_epoch": int(PROXY_MAX_STEPS_PER_EPOCH),
     }
 
+    # --- last ---
+    last_path = f"{out_prefix}_seed{seed}_last.pth"
+    torch.save({"state_dict": model_core.state_dict(), **save_common}, last_path)
+    print(f"模型已保存: {last_path}")
+
+    # --- bestTrain ---
+    if best_train_state is not None:
+        best_path = f"{out_prefix}_seed{seed}_bestTrain.pth"
+        torch.save({"state_dict": best_train_state, **save_common}, best_path)
+        print(f"模型已保存: {best_path}")
+
+
 # =============================================================
-# 主流程：search or train-only + multi-seed training + summary
+# Main
 # =============================================================
-print("\n=============================================================")
-print(f"RUN_MODE={RUN_MODE} | BEST_PARAMS_PATH={BEST_PARAMS_PATH}")
-print(f"SEARCH_SEED={SEARCH_SEED} | SEEDS={SEEDS}")
-print(f"N_TRIALS={N_TRIALS} | TOTAL_EPOCHS={TOTAL_EPOCHS} | WARMUP_EPOCHS={WARMUP_EPOCHS} | BATCH_SIZE={BATCH_SIZE}")
-print("=============================================================\n")
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run_mode", type=str, choices=["search", "train"], required=True,
+                    help="search: run optuna once and save best_params json; train: load json and train.")
+    ap.add_argument("--seed", type=int, default=43, help="Training seed (only used in run_mode=train).")
+    ap.add_argument("--n_trials", type=int, default=20, help="Optuna trials (only used in run_mode=search).")
+    ap.add_argument("--params_json", type=str, default="best_params_film_unet_voxel7.json",
+                    help="Path to save/load best_params JSON.")
+    ap.add_argument("--out_prefix", type=str, default="CNN_FiLM_sdf+bm_GN_RemoveStem",
+                    help="Prefix for output ckpt files (seed will be appended).")
+    return ap.parse_args()
 
-if RUN_MODE not in ("search", "train"):
-    raise ValueError('RUN_MODE must be "search" or "train"')
 
-if RUN_MODE == "search":
-    # ✅ search 使用固定 SEARCH_SEED，确保可比
-    set_seed(SEARCH_SEED)
-    print("开始 Optuna 超参搜索（FiLM/结构 + lr）...")
-    sampler = optuna.samplers.TPESampler(seed=SEARCH_SEED)
-    study = optuna.create_study(direction="minimize", sampler=sampler)
-    study.optimize(objective, n_trials=N_TRIALS)
-    best_params = dict(study.best_params)
+def main():
+    args = parse_args()
 
-    # 把固定常数也写入 params，确保 train-only 完整复现
-    best_params["film_hidden"] = 96
+    # 不要在 import 时就固定 seed —— 由 run_mode 决定
+    data = load_data()
 
-    print("最佳参数:", best_params)
-    save_best_params(best_params, BEST_PARAMS_PATH)
-    if not TRAIN_AFTER_SEARCH:
-        print("TRAIN_AFTER_SEARCH=0, skip training.")
-        raise SystemExit(0)
-    print("best_params saved to:", BEST_PARAMS_PATH)
-else:
-    best_params = load_best_params(BEST_PARAMS_PATH)
-    print("Loaded best_params:", best_params)
+    if args.run_mode == "search":
+        # 搜索阶段不固定 seed：不调用 set_seed()
+        run_optuna_search(data, n_trials=args.n_trials, params_json_path=args.params_json)
+        print("Search done. You can now run train mode with fixed seed(s).")
+        return
 
-# ✅ 5) 多 seed 训练 + 汇总
-results = []
-for s in SEEDS:
-    r = train_one_seed(best_params, seed=int(s))
-    results.append(r)
+    # train mode
+    best_params = load_best_params(args.params_json)
+    train_final(data, best_params, seed=args.seed, out_prefix=args.out_prefix)
 
-df_sum = pd.DataFrame(results)
-df_sum.to_csv(SUMMARY_CSV_PATH, index=False, encoding="utf-8")
-print("\n===== Seed summary =====")
-print(df_sum)
-print(f"Saved summary CSV: {SUMMARY_CSV_PATH}")
 
-# 先跑一次 Optuna 搜索 + 自动保存 best_params_film_allBlock.json，再用默认 SEED=43 训练
-# RUN_MODE=search N_TRIALS=20 SEARCH_SEED=42 SEED=43 python CNN_FiLM_sdf+bm_GN_RemoveStem.py
-# 只训练（train-only），不做任何超参搜索：读取 best_params_film.json
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_film_allBlock.json SEED=43 python CNN_FiLM_sdf+bm_GN_RemoveStem.py
-# 同一份超参，跑一组 seeds，并输出 seed_summary_film_allBlock.csv（推荐你做鲁棒性）
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_film_allBlock.json SEEDS="42,43,44,45,46" python CNN_FiLM_sdf+bm_GN_RemoveStem.py
-# 你想固定训练预算/批量大小（都只影响训练，不影响 search）
-# RUN_MODE=train BEST_PARAMS_PATH=best_params_film_allBlock.json SEEDS="42,43,44" TOTAL_EPOCHS=500 WARMUP_EPOCHS=20 BATCH_SIZE=16 python CNN_FiLM_sdf+bm_GN_RemoveStem.py
-# （如果你加了 TRAIN_AFTER_SEARCH 开关）只搜索不训练
-# RUN_MODE=search TRAIN_AFTER_SEARCH=0 SEARCH_SEED=42 N_TRIALS=20 BEST_PARAMS_PATH=best_params_film_allBlock.json python CNN_FiLM_sdf+bm_GN_RemoveStem.py
+if __name__ == "__main__":
+    main()
+# CUDA_VISIBLE_DEVICES=1,4,6 python CNN_FiLM_sdf+bm_GN_RemoveStem.py --run_mode search --n_trials 20 --params_json best_params_CNN_FiLM_sdf+bm_GN_RemoveStem.json
+# CUDA_VISIBLE_DEVICES=2,4 python CNN_FiLM_sdf+bm_GN_RemoveStem.py --run_mode train --seed 45 --params_json best_params_CNN_FiLM_sdf+bm_GN_RemoveStem.json --out_prefix CNN_FiLM_sdf+bm_GN_RemoveStem
