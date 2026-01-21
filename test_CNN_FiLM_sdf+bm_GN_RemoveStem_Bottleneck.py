@@ -3,10 +3,11 @@
 # 加载训练好的 FiLM-A(voxel7) 3D UNet 模型并在测试集上评估
 #
 # 与最新版训练脚本（CNN_FiLM_sdf&bm_7.py）对齐要点：
-# - 模型：FiLM-UNet(depth=2)，固定 7 通道体素输入（来自 cnn_input_channels_no_normals.csv）
+# - 模型：FiLM-UNet(depth=3)，固定 7 通道体素输入（来自 cnn_input_channels_no_normals.csv）
 # - FiLM 注入：ResidualBlock 内采用 BN -> FiLM -> GELU（而不是 block 输出后再 apply_film）
-# - Stem 也条件化：Conv -> BN -> FiLM -> GELU（让 bc 从第一层参与特征提取）
-# - FiLM 超参：hidden = base_ch * film_mult；gamma/beta 采用 film_scale 缩放
+# - “RemoveStem：full-res light block(enc0_full) + MaxPool 下采样”
+# - “末端：/2→/1 上采样并 concat(enc0_full skip)，再 final_conv 输出”
+# - FiLM 超参：hidden = 96
 # - 监督/门控 mask：使用 C0(inside_mask)
 # - X: StandardScaler（使用训练时保存的 mean/scale）
 # - Y: 样本级 Z-score（使用训练时保存的每个样本 mean/std；只在有效点上归一化）
@@ -25,7 +26,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 
-
 # --------------------- 设备 ---------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
@@ -35,27 +35,57 @@ if device.type == "cuda":
     torch.cuda.init()
     print(f"CUDA devices: {torch.cuda.device_count()} visible.")
 
-
 # -------------------------------------------------------------
 # 全局：体素输入 + mask（测试脚本运行时从 voxel csv 构造）
 # -------------------------------------------------------------
 GEOM_MASK = None   # (1,1,nx,ny,nz)
 VOXEL_INPUT = None # (1,7,nx,ny,nz)
 
+def make_gn(C: int, max_groups: int = 8) -> nn.GroupNorm:
+    G = min(max_groups, C)
+    while C % G != 0:
+        G -= 1
+    return nn.GroupNorm(G, C)
 
 # =============================================================
 # 模型定义（与最新版训练脚本一致）
 # =============================================================
-
-class FiLMResidualBlock(nn.Module):
-    """(Conv -> BN -> FiLM -> GELU) x2 -> Dropout3d + residual"""
+class ConvBlock(nn.Module):
+    """(Conv -> GN -> GELU) x2 -> Dropout3d + residual (NO FiLM)"""
 
     def __init__(self, in_ch: int, out_ch: int, dropout_p: float = 0.1):
         super().__init__()
         self.conv1 = nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm3d(out_ch)
+        self.norm1 = make_gn(out_ch)
         self.conv2 = nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm3d(out_ch)
+        self.norm2 = make_gn(out_ch)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout3d(dropout_p)
+        self.residual_proj = nn.Conv3d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.residual_proj(x)
+
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.act(out)
+
+        out = self.conv2(out)
+        out = self.norm2(out)
+        out = self.act(out)
+
+        out = self.drop(out)
+        return out + residual
+
+class FiLMResidualBlock(nn.Module):
+    """(Conv -> GN -> FiLM -> GELU) x2 -> Dropout3d + residual"""
+
+    def __init__(self, in_ch: int, out_ch: int, dropout_p: float = 0.1):
+        super().__init__()
+        self.conv1 = nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.norm1 = make_gn(out_ch)
+        self.conv2 = nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1)
+        self.norm2 = make_gn(out_ch)
         self.act = nn.GELU()
         self.drop = nn.Dropout3d(dropout_p)
 
@@ -65,32 +95,30 @@ class FiLMResidualBlock(nn.Module):
         residual = self.residual_proj(x)
 
         out = self.conv1(x)
-        out = self.bn1(out)
+        out = self.norm1(out)
         out = out * (1.0 + gamma) + beta
         out = self.act(out)
 
         out = self.conv2(out)
-        out = self.bn2(out)
+        out = self.norm2(out)
         out = out * (1.0 + gamma) + beta
         out = self.act(out)
 
         out = self.drop(out)
         return out + residual
 
-
 def build_model_from_ckpt(ckpt: dict) -> nn.Module:
-    """从 best_3dcnn_film_voxel7.pth 重建最新版 FiLM-A(voxel7) 网络结构。"""
+    """对齐：FiLM-bottleneck-only (Linear) 版本。"""
 
     model_type = str(ckpt.get("model_type", ""))
+
     allowed_prefixes = {
-        "FiLM_A_voxel7_stem_film_scaled",
-        "FiLM_A_voxel7_stem_film",
-        "FiLM_A_voxel7",
-        "FiLM_A",
+        "CNN_FiLM_sdf+bm_GN_RemoveStem_Bottleneck",
+        # 如果你保存时 model_type 字符串不同，把前缀也加进来
     }
     if not any(model_type.startswith(p) for p in allowed_prefixes):
         raise ValueError(
-            f"ckpt.model_type={model_type!r} 与该测试脚本不匹配（期望 FiLM_A_voxel7*）。"
+            f"ckpt.model_type={model_type!r} 与该测试脚本不匹配（期望 FiLM_bottleneck_only_linear*）。"
         )
 
     input_dim = int(ckpt["input_dim"])
@@ -98,189 +126,129 @@ def build_model_from_ckpt(ckpt: dict) -> nn.Module:
     ny = int(ckpt["ny"])
     nz = int(ckpt["nz"])
 
-    # 训练脚本已固定 depth=2，但这里仍允许从 ckpt 读取并强约束
-    depth = int(ckpt.get("depth", 2))
-    if depth != 2:
-        raise ValueError(f"该测试脚本对齐的是 depth=2，但 ckpt.depth={depth}")
+    depth = int(ckpt.get("depth", 3))
+    if depth != 3:
+        raise ValueError(f"该测试脚本对齐的是 depth=3，但 ckpt.depth={depth}")
 
     base_ch = int(ckpt.get("base_ch", 24))
     dropout_p = float(ckpt.get("dropout_p", 0.1))
-    stem_stride = int(ckpt.get("stem_stride", 2) or 2)
 
-    # ===== FiLM 超参：优先使用 film_mult + film_scale（训练脚本保存的）=====
-    film_mult = ckpt.get("film_mult", None)
-    if film_mult is None:
-        # 兼容旧 ckpt：若只有 film_hidden，则反推一个近似；否则给默认
-        film_hidden = ckpt.get("film_hidden", None)
-        if film_hidden is None or film_hidden is False:
-            film_mult = 4
-        else:
-            film_mult = max(1, int(round(float(film_hidden) / float(base_ch))))
-    film_mult = int(film_mult)
-    film_hidden = int(base_ch * film_mult)
-
+    # bottleneck-only FiLM 超参：只需要 film_scale
     film_scale = float(ckpt.get("film_scale", 1.0))
 
-    class FiLMGen(nn.Module):
-        """bc -> {gamma,beta}; 输出按 film_scale 缩放以稳定训练/推理"""
+    class FiLMGenLinear(nn.Module):
+        """Linear FiLM generator: bc -> (gamma, beta) for bottleneck only."""
 
-        def __init__(self, input_dim: int, ch_list: list[int], hidden: int, scale: float):
+        def __init__(self, input_dim: int, C: int, scale: float):
             super().__init__()
-            self.ch_list = ch_list
+            self.C = int(C)
             self.scale = float(scale)
-            out_dim = 2 * sum(ch_list)
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, hidden),
-                nn.GELU(),
-                nn.Linear(hidden, hidden),
-                nn.GELU(),
-                nn.Linear(hidden, out_dim),
-            )
+            self.fc = nn.Linear(input_dim, 2 * self.C)
 
         def forward(self, bc: torch.Tensor):
             B = bc.size(0)
-            v = self.net(bc)  # (B, 2*sumC)
-            gammas, betas = [], []
-            offset = 0
-            s = self.scale
-            for C in self.ch_list:
-                g_raw = v[:, offset: offset + C]; offset += C
-                b_raw = v[:, offset: offset + C]; offset += C
-                g = s * g_raw
-                b = s * b_raw
-                gammas.append(g.view(B, C, 1, 1, 1))
-                betas.append(b.view(B, C, 1, 1, 1))
-            return gammas, betas
+            v = self.fc(bc)  # (B, 2C)
+            g_raw = v[:, : self.C]
+            b_raw = v[:, self.C :]
 
-    class CNN3D_FiLM(nn.Module):
+            s = self.scale
+            gamma = (s * g_raw).view(B, self.C, 1, 1, 1)
+            beta  = (s * b_raw).view(B, self.C, 1, 1, 1)
+            return gamma, beta
+
+    class CNN3D_FiLM_BottleneckOnly(nn.Module):
         def __init__(self):
             super().__init__()
             self.nx, self.ny, self.nz = nx, ny, nz
-            self.depth = 2
+            self.depth = 3
             self.base_ch = base_ch
-            self.film_mult = film_mult
-            self.film_hidden = film_hidden
             self.film_scale = film_scale
-            self.stem_stride = stem_stride
 
-            # 固定输入：7 通道体素输入 + mask
-            assert VOXEL_INPUT is not None, "VOXEL_INPUT 未初始化：请先读取 cnn_input_channels_no_normals.csv"
-            assert GEOM_MASK is not None, "GEOM_MASK 未初始化：请先从 C0 构造 mask"
+            assert VOXEL_INPUT is not None, "VOXEL_INPUT 未初始化：请先读取 voxel csv"
+            assert GEOM_MASK is not None, "GEOM_MASK 未初始化：请先构造 mask"
             self.register_buffer("voxel_input", VOXEL_INPUT)  # (1,7,nx,ny,nz)
             self.register_buffer("geom_mask", GEOM_MASK)      # (1,1,nx,ny,nz)
 
-            # Stem：Conv -> BN -> FiLM -> GELU
-            self.stem_conv = nn.Conv3d(7, base_ch, kernel_size=3, padding=1, stride=self.stem_stride)
-            self.stem_bn = nn.BatchNorm3d(base_ch)
-            self.stem_act = nn.GELU()
+            # full-res light
+            c0 = max(8, base_ch // 2)
+            self.c0 = c0
 
-            # Encoder
-            self.enc0 = FiLMResidualBlock(base_ch, base_ch, dropout_p=dropout_p)
-            self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2)
-            self.enc1 = FiLMResidualBlock(base_ch, base_ch * 2, dropout_p=dropout_p)
+            # /1
+            self.enc0_full = ConvBlock(7, c0, dropout_p=dropout_p)
+            self.pool0 = nn.MaxPool3d(2, 2)  # /2
 
-            # Bottleneck
-            bottleneck_ch = base_ch * 2
+            # encoder /2,/4,/8
+            self.enc0 = ConvBlock(c0, base_ch, dropout_p=dropout_p)          # /2
+            self.pool1 = nn.MaxPool3d(2, 2)                                  # /4
+            self.enc1 = ConvBlock(base_ch, base_ch * 2, dropout_p=dropout_p) # /4
+            self.pool2 = nn.MaxPool3d(2, 2)                                  # /8
+            self.enc2 = ConvBlock(base_ch * 2, base_ch * 4, dropout_p=dropout_p) # /8
+
+            # bottleneck FiLM only
+            bottleneck_ch = base_ch * 4
+            self.bottleneck_ch = bottleneck_ch
+            self.film = FiLMGenLinear(input_dim=input_dim, C=bottleneck_ch, scale=film_scale)
             self.bottleneck = FiLMResidualBlock(bottleneck_ch, bottleneck_ch, dropout_p=dropout_p)
 
-            # Decoder (depth=2 只有 up1)
-            self.up1_conv = FiLMResidualBlock(bottleneck_ch + base_ch, base_ch, dropout_p=dropout_p)
+            # decoder /8->/4->/2
+            self.up2_conv = ConvBlock(bottleneck_ch + base_ch * 2, base_ch * 2, dropout_p=dropout_p)
+            self.up1_conv = ConvBlock(base_ch * 2 + base_ch, base_ch, dropout_p=dropout_p)
             self.out_proj = nn.Conv3d(base_ch, base_ch, kernel_size=1)
 
-            # 全分辨率融合：decoder_feat + 7 通道体素输入
-            self.geom_block = FiLMResidualBlock(base_ch + 7, base_ch, dropout_p=dropout_p)
-            self.final_conv = nn.Conv3d(base_ch, 1, kernel_size=1)
-
-            # FiLM 注入点通道列表（严格对齐训练脚本的 forward 顺序）
-            # 0) stem, 1) enc0, 2) enc1, 3) bottleneck, 4) up1, 5) geom_block
-            ch_list = [base_ch, base_ch, base_ch * 2, base_ch * 2, base_ch, base_ch]
-            self.film = FiLMGen(input_dim=input_dim, ch_list=ch_list, hidden=film_hidden, scale=film_scale)
+            # /2 -> /1 + concat full-res skip
+            self.up0_conv = ConvBlock(base_ch + c0, c0, dropout_p=dropout_p)
+            self.final_conv = nn.Conv3d(c0, 1, kernel_size=1)
 
         def forward(self, bc: torch.Tensor) -> torch.Tensor:
             B = bc.size(0)
-            vox = self.voxel_input.expand(B, -1, -1, -1, -1)    # (B,7,nx,ny,nz)
-            mask_ch = self.geom_mask.expand(B, -1, -1, -1, -1)  # (B,1,nx,ny,nz)
+            vox = self.voxel_input.expand(B, -1, -1, -1, -1)      # (B,7,nx,ny,nz)
+            mask_ch = self.geom_mask.expand(B, -1, -1, -1, -1)    # (B,1,nx,ny,nz)
 
-            gammas, betas = self.film(bc)
-            gi = 0
+            # /1
+            x_full_skip = self.enc0_full(vox)
+            # /2
+            x = self.pool0(x_full_skip)
 
-            # Stem: Conv -> BN -> FiLM -> GELU
-            x = self.stem_conv(vox)
-            x = self.stem_bn(x)
-            x = x * (1.0 + gammas[gi]) + betas[gi]
-            x = self.stem_act(x)
-            gi += 1
-
-            # Encoder
-            x0 = self.enc0(x, gammas[gi], betas[gi]); gi += 1
+            # encoder
+            x0 = self.enc0(x)          # /2
             x1 = self.pool1(x0)
-            x1 = self.enc1(x1, gammas[gi], betas[gi]); gi += 1
+            x1 = self.enc1(x1)         # /4
+            x2 = self.pool2(x1)
+            x2 = self.enc2(x2)         # /8
 
-            # Bottleneck
-            xb = self.bottleneck(x1, gammas[gi], betas[gi]); gi += 1
+            # bottleneck FiLM
+            gamma, beta = self.film(bc)        # (B,4C,1,1,1)
+            xb = self.bottleneck(x2, gamma, beta)
 
-            # Decoder up1
-            x_up = F.interpolate(xb, size=x0.shape[2:], mode="trilinear", align_corners=False)
-            x_cat = torch.cat([x_up, x0], dim=1)
-            x_dec = self.up1_conv(x_cat, gammas[gi], betas[gi]); gi += 1
-            x_dec = self.out_proj(x_dec)
+            # decoder
+            x_up2 = F.interpolate(xb, size=x1.shape[2:], mode="trilinear", align_corners=False)
+            x_dec2 = self.up2_conv(torch.cat([x_up2, x1], dim=1))
 
-            # Back to full resolution
-            x_dec_full = F.interpolate(x_dec, size=(self.nx, self.ny, self.nz), mode="trilinear", align_corners=False)
+            x_up1 = F.interpolate(x_dec2, size=x0.shape[2:], mode="trilinear", align_corners=False)
+            x_dec1 = self.up1_conv(torch.cat([x_up1, x0], dim=1))
 
-            # Fuse with voxel input at full res
-            vox_full = self.voxel_input.expand(B, -1, -1, -1, -1)
-            x_full = torch.cat([x_dec_full, vox_full], dim=1)  # (B,base_ch+7,nx,ny,nz)
-            x_full = self.geom_block(x_full, gammas[gi], betas[gi]); gi += 1
-            x_full = self.final_conv(x_full)
+            x_dec = self.out_proj(x_dec1)  # /2
+
+            # /1
+            x_up0 = F.interpolate(x_dec, size=x_full_skip.shape[2:], mode="trilinear", align_corners=False)
+            x0_full = self.up0_conv(torch.cat([x_up0, x_full_skip], dim=1))
+            x_full = self.final_conv(x0_full)  # (B,1,nx,ny,nz)
 
             out = x_full.squeeze(1)
             out = out * mask_ch.squeeze(1)
             return out
 
-    return CNN3D_FiLM()
-
+    return CNN3D_FiLM_BottleneckOnly()
 
 # =============================================================
 # Masked Loss（与训练脚本一致；用于在测试集上报告 scaled-space loss）
 # =============================================================
 
-def masked_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor,
-    loss_type: str = "huber",
-    grad_weight: float = 0.1,
-) -> torch.Tensor:
-    """pred/target/mask: (B, nx, ny, nz), mask=1 表示真实点"""
-
-    if loss_type == "huber":
-        per_elem = F.smooth_l1_loss(pred, target, reduction="none")
-        masked = per_elem * mask
-    else:
-        masked = ((pred - target) ** 2) * mask
-    base_loss = masked.sum() / (mask.sum() + 1e-8)
-
-    def _spatial_grads(t: torch.Tensor):
-        gx = t[:, 1:, :, :] - t[:, :-1, :, :]
-        gy = t[:, :, 1:, :] - t[:, :, :-1, :]
-        gz = t[:, :, :, 1:] - t[:, :, :, :-1]
-        return gx, gy, gz
-
-    pred_dx, pred_dy, pred_dz = _spatial_grads(pred)
-    true_dx, true_dy, true_dz = _spatial_grads(target)
-
-    mask_dx = mask[:, 1:, :, :] * mask[:, :-1, :, :]
-    mask_dy = mask[:, :, 1:, :] * mask[:, :, :-1, :]
-    mask_dz = mask[:, :, :, 1:] * mask[:, :, :, :-1]
-
-    grad_loss = pred.new_tensor(0.0)
-    for pd, td, md in [(pred_dx, true_dx, mask_dx), (pred_dy, true_dy, mask_dy), (pred_dz, true_dz, mask_dz)]:
-        grad_loss += (((pd - td) ** 2) * md).sum() / (md.sum() + 1e-8)
-    grad_loss = grad_loss / 3.0
-
-    return base_loss + grad_weight * grad_loss
-
+def masked_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """与训练脚本一致：masked smooth_l1（scaled space）"""
+    per_elem = F.smooth_l1_loss(pred, target, reduction="none")
+    masked = per_elem * mask
+    return masked.sum() / (mask.sum() + 1e-8)
 
 # =============================================================
 # 指标（仅在 mask==1 的真实点上计算）
@@ -333,7 +301,6 @@ def _masked_metrics_per_sample(pred_np: np.ndarray, true_np: np.ndarray, mask_np
     grad_mse = grad_mse_sum / max(grad_cnt, 1)
     return nrmse, mae, mse, r2, grad_mse
 
-
 # =============================================================
 # 参数统计
 # =============================================================
@@ -341,12 +308,10 @@ def _masked_metrics_per_sample(pred_np: np.ndarray, true_np: np.ndarray, mask_np
 def _format_int(n: int) -> str:
     return f"{n:,}"
 
-
 def count_parameters(m: nn.Module):
     total = sum(p.numel() for p in m.parameters())
     trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
     return total, trainable
-
 
 def parameter_breakdown(m: nn.Module):
     owner_type = {}
@@ -375,14 +340,12 @@ def parameter_breakdown(m: nn.Module):
 
     return by_type_total, by_type_train, by_top_total, by_top_train
 
-
 # =============================================================
 # 结果保存：预测场 + 有效点 CSV + ✅整场 CSV
 # =============================================================
 
 def _ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
-
 
 def _lin_to_ijk(lin: np.ndarray, ny: int, nz: int):
     lin = lin.astype(np.int64)
@@ -391,7 +354,6 @@ def _lin_to_ijk(lin: np.ndarray, ny: int, nz: int):
     iy = rem // nz
     iz = rem % nz
     return ix, iy, iz
-
 
 def _full_grid_xyz_columns(x_unique: np.ndarray, y_unique: np.ndarray, z_unique: np.ndarray):
     """
@@ -414,7 +376,6 @@ def _full_grid_xyz_columns(x_unique: np.ndarray, y_unique: np.ndarray, z_unique:
 
     assert xs.size == n and ys.size == n and zs.size == n
     return xs, ys, zs
-
 
 def save_prediction_artifacts(
     out_dir: str,
@@ -489,12 +450,11 @@ def save_prediction_artifacts(
         out_path = os.path.join(out_dir, f"sample_{sample_id:04d}_fullgrid.csv")
         df_full.to_csv(out_path, index=False, chunksize=csv_fullgrid_chunksize)
 
-
 # =============================================================
 # 主流程：加载 ckpt → 读取 voxel/temp/bc → 构建 test set → 推理评估
 # =============================================================
 
-CKPT_PATH = "best_3dcnn_film_voxel7.pth"
+CKPT_PATH = "CNN_FiLM_sdf+bm_GN_RemoveStem_Bottleneck_seed45_last.pth"
 datapath_bc = "data/boundary_condition.csv"
 datapath_temp = "data/Temp_all.csv"
 datapath_voxel = "data/cnn_input_channels_no_normals.csv"
@@ -516,12 +476,12 @@ ckpt = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
 print("===== ckpt meta =====")
 print(
     f"model_type={ckpt.get('model_type','NA')}, depth={ckpt.get('depth','NA')}, base_ch={ckpt.get('base_ch','NA')}, "
-    f"dropout_p={ckpt.get('dropout_p','NA')}, stem_stride={ckpt.get('stem_stride','NA')}"
+    f"dropout_p={ckpt.get('dropout_p','NA')}"
 )
 print(
-    f"film_mult={ckpt.get('film_mult','NA')}, film_scale={ckpt.get('film_scale','NA')}, "
-    f"lr={ckpt.get('lr','NA')}, weight_decay={ckpt.get('weight_decay','NA')}, "
-    f"loss_type={ckpt.get('loss_type','NA')}, grad_weight={ckpt.get('grad_weight','NA')}"
+    f"film_hidden={ckpt.get('film_hidden','NA')}, film_scale={ckpt.get('film_scale','NA')}, "
+    f"film_mlp_dropout={ckpt.get('film_mlp_dropout','NA')}, film_lr_mult={ckpt.get('film_lr_mult','NA')}, "
+    f"lr={ckpt.get('lr','NA')}"
 )
 
 # -------------------------------------------------------------
@@ -569,18 +529,27 @@ for i in range(df_vox.shape[0]):
     iz = z_index[float(zv[i])]
     voxel_grid[:, ix, iy, iz] = np.array([c[i] for c in cols_np], dtype=np.float32)
 
-# C0 作为 inside_mask
-if "C0" not in col_order:
-    raise ValueError(f"voxel_cols 必须包含 C0 用于 mask，但现在是: {col_order}")
-geom_mask_np = (voxel_grid[col_order.index("C0")] > 0.5).astype(np.float32)
-GEOM_MASK = torch.tensor(geom_mask_np[None, None, ...], dtype=torch.float32, device=device)
+# VOXEL_INPUT 先构建（训练端固定 7 通道体素输入）
 VOXEL_INPUT = torch.tensor(voxel_grid[None, ...], dtype=torch.float32, device=device)
-print(f"C0(inside_mask) 占比: {geom_mask_np.mean() * 100:.3f}%")
 
-lin_ckpt = ckpt.get("lin_valid", None)
-if lin_ckpt is None:
-    raise ValueError("ckpt 中未找到 lin_valid；请使用新版训练脚本保存的模型。")
-lin = np.asarray(lin_ckpt, dtype=np.int64)
+# mask：优先使用 ckpt["geom_mask_np"]；否则从 C0 重建
+if "geom_mask_np" in ckpt and ckpt["geom_mask_np"] is not None:
+    geom_mask_np = np.asarray(ckpt["geom_mask_np"], dtype=np.float32)
+    if geom_mask_np.shape != (nx, ny, nz):
+        raise ValueError(f"ckpt.geom_mask_np shape={geom_mask_np.shape} != {(nx,ny,nz)}")
+else:
+    if "C0" not in col_order:
+        raise ValueError(f"voxel_cols 必须包含 C0 用于 mask，但现在是: {col_order}")
+    geom_mask_np = (voxel_grid[col_order.index("C0")] > 0.5).astype(np.float32)
+
+GEOM_MASK = torch.tensor(geom_mask_np[None, None, ...], dtype=torch.float32, device=device)
+print(f"inside_mask 占比: {geom_mask_np.mean() * 100:.3f}%")
+
+# valid 点：优先使用 ckpt["lin_valid"]；否则从 mask 推导
+if "lin_valid" in ckpt and ckpt["lin_valid"] is not None:
+    lin = np.asarray(ckpt["lin_valid"], dtype=np.int64)
+else:
+    lin = np.where(geom_mask_np.reshape(-1) > 0.5)[0].astype(np.int64)
 
 # -------------------------------------------------------------
 # 读取温度：支持两种格式
@@ -679,17 +648,12 @@ y_test_scaled = y_test_scaled.reshape((len(test_idx), nx, ny, nz))
 # -------------------------------------------------------------
 model = build_model_from_ckpt(ckpt).to(device)
 
-if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-    print(f"使用 {torch.cuda.device_count()} 张 GPU 进行数据并行推理...")
-    model = nn.DataParallel(model)
-
 state_dict = ckpt["state_dict"]
 # 兼容保存时带 module. 前缀的情况
 if any(k.startswith("module.") for k in state_dict.keys()):
     state_dict = {(k[len("module."):] if k.startswith("module.") else k): v for k, v in state_dict.items()}
 
-model_core = model.module if isinstance(model, nn.DataParallel) else model
-missing, unexpected = model_core.load_state_dict(state_dict, strict=False)
+missing, unexpected = model.load_state_dict(state_dict, strict=True)
 if missing:
     print("[Warning] Missing keys:", missing)
 if unexpected:
@@ -719,7 +683,7 @@ print("")
 # -------------------------------------------------------------
 # DataLoader
 # -------------------------------------------------------------
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 
 test_loader = DataLoader(
     TensorDataset(
@@ -736,9 +700,6 @@ test_loader = DataLoader(
 # 推理 + 评估
 # =============================================================
 NRMSE_list, MAE_list, MSE_list, R2_list, GradMSE_list = [], [], [], [], []
-
-loss_type_ckpt = ckpt.get("loss_type", "mse")
-grad_weight_ckpt = float(ckpt.get("grad_weight", 0.1))
 
 loss_sum = 0.0
 count_sum = 0
@@ -770,7 +731,7 @@ with torch.no_grad():
         pred_batches += 1
         pred_samples += int(B)
 
-        batch_loss = masked_loss(pred_scaled, yb_scaled, mb, loss_type=loss_type_ckpt, grad_weight=grad_weight_ckpt)
+        batch_loss = masked_loss(pred_scaled, yb_scaled, mb)
         loss_sum += float(batch_loss.item()) * int(B)
         count_sum += int(B)
 
@@ -826,7 +787,7 @@ if pred_batches > 0:
 
 if count_sum > 0:
     print("===== Test masked_loss (scaled space) =====")
-    print(f"loss={loss_sum / count_sum:.6f} (loss_type={loss_type_ckpt}, grad_weight={grad_weight_ckpt})")
+    print(f"loss={loss_sum / count_sum:.6f}")
 
 print("===== Per-sample metrics (mask==1) =====")
 for i in range(len(test_idx)):
@@ -849,5 +810,156 @@ print(f"MSE    : mean={np.nanmean(MSE_arr):.6f}, std={np.nanstd(MSE_arr):.6f}")
 print(f"R2     : mean={np.nanmean(R2_arr):.6f}, std={np.nanstd(R2_arr):.6f}")
 print(f"GradMSE: mean={np.nanmean(GradMSE_arr):.6e}, std={np.nanstd(GradMSE_arr):.6e}")
 
-print("测试完成。")
-# CUDA_VISIBLE_DEVICES=1,2,3,4,5 python "test_3dcnn_film_voxel7.py"
+# =============================================================
+# 轻量化/效率对比：测试脚本可测指标输出（推理侧为主）
+# - Params (M)
+# - Checkpoint size (MB)
+# - GFLOPs / forward (B=1, 仅估算 Conv/Linear)
+# - Peak VRAM inference (GB)
+# - Max batch size (fp32 / fp16) —— 推理 forward-only 近似上限
+# - Inference latency (ms/sample) —— 已在上面输出 forward-only
+# 注：Peak VRAM training / Train step time 更适合放训练脚本；此处可选做一次“单步反传”基准（默认关闭）。
+# =============================================================
+
+def _ckpt_size_mb(path: str) -> float:
+    try:
+        return os.path.getsize(path) / (1024.0 * 1024.0)
+    except OSError:
+        return float("nan")
+
+def _params_m(model: nn.Module) -> float:
+    return sum(p.numel() for p in model.parameters()) / 1e6
+
+def estimate_gflops_forward(model: nn.Module, bc_example: torch.Tensor) -> float:
+    """
+    通过一次前向的 hook 估算 GFLOPs（只统计 Conv3d / Linear；FLOPs≈2*MACs）。
+    这是“模型结构复杂度”的近似指标：不同 GPU/库实现会导致实际时间不同，但 GFLOPs 可用于论文对比。
+    """
+    macs = 0
+
+    def conv3d_hook(mod: nn.Conv3d, inp, out):
+        nonlocal macs
+        # out: (B,Cout,Ox,Oy,Oz)
+        out_t = out
+        B, Cout, Ox, Oy, Oz = out_t.shape
+        Cin = mod.in_channels
+        kx, ky, kz = mod.kernel_size if isinstance(mod.kernel_size, tuple) else (mod.kernel_size,) * 3
+        groups = mod.groups
+        # MACs per output element = (Cin/groups)*kx*ky*kz
+        macs += int(B) * int(Cout) * int(Ox) * int(Oy) * int(Oz) * (int(Cin) // int(groups)) * int(kx) * int(ky) * int(kz)
+
+    def linear_hook(mod: nn.Linear, inp, out):
+        nonlocal macs
+        # out: (..., out_features)
+        out_t = out
+        out_elems = out_t.numel()
+        macs += int(out_elems) * int(mod.in_features)
+
+    hooks = []
+    for m in model.modules():
+        if isinstance(m, nn.Conv3d):
+            hooks.append(m.register_forward_hook(conv3d_hook))
+        elif isinstance(m, nn.Linear):
+            hooks.append(m.register_forward_hook(linear_hook))
+
+    model_was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        _ = model(bc_example)
+    for h in hooks:
+        h.remove()
+    if model_was_training:
+        model.train()
+
+    gflops = (2.0 * float(macs)) / 1e9
+    return gflops
+
+def probe_max_batch_inference(model: nn.Module, device: torch.device, fp16: bool, max_cap: int = 512) -> int:
+    """
+    仅 forward-only 的 batch 上限探测（用于论文“可跑的最大 batch”对比）。
+    采用指数增长 + 二分搜索；每次尝试都会 synchronize，避免异步导致的误判。
+    """
+    if device.type != "cuda":
+        return 0
+    def try_bs(bs: int) -> bool:
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            bc = torch.zeros((bs, 6), device=device, dtype=torch.float32)
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=fp16, dtype=torch.float16):
+                    _ = model(bc)
+            torch.cuda.synchronize()
+            return True
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if ("out of memory" in msg) or ("cuda" in msg and "memory" in msg):
+                return False
+            raise
+    # exponential search
+    lo, hi = 1, 1
+    while hi < max_cap and try_bs(hi):
+        lo = hi
+        hi *= 2
+    hi = min(hi, max_cap)
+    # binary search in [lo, hi]
+    best = lo if try_bs(lo) else 0
+    l, r = best, hi
+    while l <= r:
+        mid = (l + r) // 2
+        if try_bs(mid):
+            best = mid
+            l = mid + 1
+        else:
+            r = mid - 1
+    return best
+def measure_peak_vram_inference(model: nn.Module, device: torch.device, fp16: bool, bs: int = 1) -> float:
+    """返回 peak allocated GB（forward-only）。"""
+    if device.type != "cuda":
+        return float("nan")
+    was_training = model.training
+    model.eval()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    bc = torch.zeros((bs, 6), device=device, dtype=torch.float32)
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(enabled=fp16, dtype=torch.float16):
+            _ = model(bc)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated()
+    if was_training:
+        model.train()
+    return float(peak) / (1024.0 ** 3)
+
+print("\n===== Lightweightness / Efficiency report (test-side) =====")
+print(f"Checkpoint size (MB): {_ckpt_size_mb(CKPT_PATH):.3f}")
+
+core_bench = model.module if isinstance(model, nn.DataParallel) else model
+print(f"Params (M): {_params_m(core_bench):.3f}")
+
+# GFLOPs / forward (B=1)
+try:
+    bc1 = torch.zeros((1, 6), device=device, dtype=torch.float32)
+    gflops = estimate_gflops_forward(core_bench.to(device), bc1)
+    print(f"GFLOPs / forward (B=1, est.): {gflops:.3f}")
+except Exception as e:
+    print(f"GFLOPs / forward (B=1, est.): NA ({e})")
+
+# Peak VRAM inference
+if device.type == "cuda":
+    peak_fp32 = measure_peak_vram_inference(model, device=device, fp16=False, bs=1)
+    peak_fp16 = measure_peak_vram_inference(model, device=device, fp16=True, bs=1)
+    print(f"Peak VRAM inference (GB) fp32 (B=1): {peak_fp32:.3f}")
+    print(f"Peak VRAM inference (GB) fp16 (B=1): {peak_fp16:.3f}")
+
+    # Max batch size (forward-only)
+    try:
+        max_bs_fp32 = probe_max_batch_inference(model, device=device, fp16=False, max_cap=512)
+        max_bs_fp16 = probe_max_batch_inference(model, device=device, fp16=True, max_cap=1024)
+        print(f"Max batch size fp32 (forward-only, cap): {max_bs_fp32}")
+        print(f"Max batch size fp16 (forward-only, cap): {max_bs_fp16}")
+    except Exception as e:
+        print(f"Max batch size probe: NA ({e})")
+
+# CUDA_VISIBLE_DEVICES=1,3,4,5,6 python "test_CNN_FiLM_sdf+bm_GN_RemoveStem_Bottleneck.py"
+
